@@ -11,13 +11,23 @@
 *.so
 *.dylib
 
+# Node / npm / pnpm
+node_modules/
+.pnpm-store/
+pnpm-debug.log
+
+# Next.js
+dist/
+.next/
+out/
+build/
+
 # IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
 *.iml
-.DS_Store
 
 # Docker
 .docker
