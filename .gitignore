@@ -1,0 +1,42 @@
+# Environment variables and secrets
+.env
+.env.local
+.env*.local
+
+# Go build artifacts
+/bin/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*.iml
+.DS_Store
+
+# Docker
+.docker
+docker-compose.override.yml
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+*.log
+
+# ngrok
+ngrok
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+/tmp/
+*.tmp

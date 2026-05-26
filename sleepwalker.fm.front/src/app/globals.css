@@ -1,0 +1,9 @@
+@import '../styles/index.css';
+
+html, body {
+  min-height: 100%;
+}
+
+body {
+  background: #0a0118;
+}
