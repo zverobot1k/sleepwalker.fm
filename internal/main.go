@@ -8,7 +8,12 @@ import (
 
 	"sleepwalker.fm/internal/config"
 	"sleepwalker.fm/internal/repository/postgres"
+	authservice "sleepwalker.fm/internal/service/auth"
+	lastfmservice "sleepwalker.fm/internal/service/lastfm"
+	"sleepwalker.fm/internal/service/pipeline"
+	recommendationservice "sleepwalker.fm/internal/service/recommendation"
 	"sleepwalker.fm/internal/service/spotify"
+	tokenservice "sleepwalker.fm/internal/service/token"
 	transport "sleepwalker.fm/internal/transport/http"
 	"sleepwalker.fm/internal/transport/http/handlers"
 )
@@ -33,19 +38,41 @@ func main() {
 	}
 	defer sqlDB.Close()
 
-	if err := db.Gorm.AutoMigrate(&postgres.OAuthState{}, &postgres.SpotifyToken{}); err != nil {
+	if err := db.Gorm.AutoMigrate(&postgres.OAuthState{}, &postgres.SpotifyToken{}, &postgres.ArtistMetadata{}); err != nil {
 		log.Fatalf("db migration failed: %v", err)
 	}
 
 	stateRepo := postgres.NewOAuthStateRepo(db)
 	tokenRepo := postgres.NewTokenRepo(db)
+	artistMetadataRepo := postgres.NewArtistMetadataRepo(db)
 
 	httpClient := &http.Client{Timeout: 15 * time.Second}
 	oauthService := spotify.NewOAuthService(cfg, httpClient, stateRepo, tokenRepo)
+	if cfg.LastFmAPIKey == "" {
+		log.Print("warning: LASTFM_API_KEY is not set; Last.fm enrichment will be disabled")
+	}
+	lastfmClient := lastfmservice.NewClient(cfg.LastFmAPIKey, &http.Client{Timeout: 10 * time.Second})
 
-	oauthHandler := handlers.NewOAuthHandler(oauthService, cfg.FrontendURL)
+	tokenSvc := tokenservice.NewService(tokenRepo, oauthService)
+	spotifyAPI := spotify.NewAPIService(cfg, httpClient, tokenSvc)
+	lastfmSvc := lastfmservice.NewService(lastfmClient)
+	pipe := pipeline.New(spotifyAPI, lastfmSvc)
+	recSvc := recommendationservice.NewService(spotifyAPI, lastfmSvc)
+	authSvc := authservice.New(oauthService, tokenSvc)
+
+	oauthHandler := handlers.NewOAuthHandler(authSvc, cfg.FrontendURL)
 	healthHandler := handlers.NewHealthHandler()
-	spotifyAPIHandler := handlers.NewSpotifyAPIHandler(tokenRepo)
+	spotifyAPIHandler := handlers.NewSpotifyAPIHandlerFull(
+		tokenRepo,
+		artistMetadataRepo,
+		lastfmClient,
+		oauthService,
+		tokenSvc,
+		spotifyAPI,
+		pipe,
+		recSvc,
+		lastfmSvc,
+	)
 
 	router := transport.NewRouter(transport.RouterDeps{
 		OAuth:      oauthHandler,

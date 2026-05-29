@@ -15,20 +15,39 @@ services:
       timeout: 5s
       retries: 30
 
-  app:
-    build: .
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
     env_file:
       - .env
     environment:
       DATABASE_URL: "postgres://postgres:postgres@db:5432/sleepwalker?sslmode=disable"
       SERVER_ADDR: ":8080"
+      BASE_URL: "http://localhost:8080"
       FRONTEND_URL: "http://localhost:3000"
-      SPOTIFY_SCOPES: "user-read-email user-read-private user-top-read user-read-recently-played user-library-read user-follow-read playlist-read-private"
+      SPOTIFY_REDIRECT_URI: "http://localhost:8080/auth/spotify/callback"
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET}
+      LASTFM_API_KEY: ${LASTFM_API_KEY}
+      LASTFM_SHARED_SECRET: ${LASTFM_SHARED_SECRET}
     depends_on:
       db:
         condition: service_healthy
     ports:
       - "8080:8080"
+
+  frontend:
+    build:
+      context: ./sleepwalker.fm.front
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: "http://localhost:8080"
+        API_INTERNAL_URL: "http://backend:8080"
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
 
 volumes:
   postgres_data:

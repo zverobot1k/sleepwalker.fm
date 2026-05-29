@@ -4,7 +4,10 @@ import { motion } from 'framer-motion';
 import { Sparkles, Music } from 'lucide-react';
 import { useI18n } from '@/components/providers/i18n-provider';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8080';
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_URL ||
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  'http://localhost:8080';
 
 export default function LandingPage() {
   const { t } = useI18n();

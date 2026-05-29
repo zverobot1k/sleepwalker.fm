@@ -5,20 +5,20 @@ import (
 	"net/url"
 
 	"github.com/gin-gonic/gin"
-	"sleepwalker.fm/internal/service/spotify"
+	authservice "sleepwalker.fm/internal/service/auth"
 )
 
 type OAuthHandler struct {
-	oauth       *spotify.OAuthService
+	auth        *authservice.Service
 	frontendURL string
 }
 
-func NewOAuthHandler(oauth *spotify.OAuthService, frontendURL string) *OAuthHandler {
-	return &OAuthHandler{oauth: oauth, frontendURL: frontendURL}
+func NewOAuthHandler(auth *authservice.Service, frontendURL string) *OAuthHandler {
+	return &OAuthHandler{auth: auth, frontendURL: frontendURL}
 }
 
 func (h *OAuthHandler) Login(c *gin.Context) {
-	url, err := h.oauth.StartLogin(c.Request.Context())
+	url, err := h.auth.StartLogin(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -30,7 +30,7 @@ func (h *OAuthHandler) Callback(c *gin.Context) {
 	code := c.Query("code")
 	state := c.Query("state")
 
-	profile, err := h.oauth.HandleCallback(c.Request.Context(), code, state)
+	profile, err := h.auth.HandleCallback(c.Request.Context(), code, state)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -50,7 +50,7 @@ func (h *OAuthHandler) Refresh(c *gin.Context) {
 		return
 	}
 
-	updated, err := h.oauth.RefreshAccessToken(c.Request.Context(), userID)
+	updated, err := h.auth.RefreshTokens(c.Request.Context(), userID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -62,4 +62,19 @@ func (h *OAuthHandler) Refresh(c *gin.Context) {
 		"scope":      updated.Scope,
 		"token_type": updated.TokenType,
 	})
+}
+
+// Session returns safe session state for the frontend (no refresh token).
+func (h *OAuthHandler) Session(c *gin.Context) {
+	userID := c.Param("userId")
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing userId"})
+		return
+	}
+	state, err := h.auth.SessionState(c.Request.Context(), userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, state)
 }

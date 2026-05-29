@@ -102,8 +102,14 @@ export default function WrappedPage() {
         <div className="p-5 rounded-2xl border border-glass-border bg-glass-bg">
           <h2 className="text-lg font-semibold mb-3">Top Genres</h2>
           <ul className="space-y-2 text-sm">
-            {(summary?.top_genres || []).slice(0, 10).map((g) => (
-              <li key={g.genre} className="flex justify-between"><span>{g.genre}</span><span>{g.count}</span></li>
+            {(summary?.top_genres || []).slice(0, 10).map((g, index) => (
+              <li key={g.genre} className="flex items-center justify-between gap-3">
+                <span className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-glass-border bg-secondary/30 text-xs font-semibold text-foreground">
+                  {index + 1}
+                </span>
+                <span className="flex-1">{g.genre}</span>
+                <span>{g.count}</span>
+              </li>
             ))}
           </ul>
         </div>
@@ -128,7 +134,7 @@ export default function WrappedPage() {
           <div className="grid grid-cols-2 md:grid-cols-6 gap-2 text-xs text-muted-foreground">
             {timeline.by_hour.map((item) => (
               <div key={item.key} className="rounded-lg p-2 border border-glass-border bg-secondary/20">
-                <div>{item.key}:00</div>
+                <div>{item.key}</div>
                 <div className="font-semibold text-foreground">{item.plays}</div>
               </div>
             ))}

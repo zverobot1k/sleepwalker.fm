@@ -220,9 +220,25 @@ export default function DashboardPage() {
             <div className="space-y-3 text-sm text-muted-foreground">
               <p>Top artists: {(data.wrapped.top_artists || []).slice(0, 3).map((a) => a.name).join(', ') || '-'}</p>
               <p>Top tracks: {(data.wrapped.top_tracks || []).slice(0, 3).map((t) => t.name).join(', ') || '-'}</p>
-              <p>Top genres: {(data.wrapped.top_genres || []).slice(0, 3).map((g) => g.genre).join(', ') || '-'}</p>
-              <p>{t('source')}: /api/wrapped/summary/:userId</p>
+              <p>Top genres (Last.fm): {(data.wrapped.top_genres || []).slice(0, 3).map((g) => g.genre).join(', ') || '-'}</p>
+              <p>Recent plays: {data.wrapped.recent_plays_count ?? '-'}</p>
             </div>
+          )}
+        </Panel>
+
+        <Panel title="Recommendations">
+          {!data.recs?.items?.length ? (
+            <EmptyState text={data.recs?.source === 'top_tracks_fallback' ? 'Fallback: top tracks' : t('empty')} />
+          ) : (
+            <ul className="space-y-2 text-sm">
+              {data.recs.items.slice(0, 5).map((item, idx) => (
+                <li key={`${item.track?.id || idx}`}>
+                  <span className="font-medium">{item.track?.name}</span>
+                  <span className="text-muted-foreground text-xs block">{item.reason}</span>
+                </li>
+              ))}
+              <li className="text-xs text-muted-foreground pt-1">Source: {data.recs.source}</li>
+            </ul>
           )}
         </Panel>
       </div>
@@ -230,10 +246,15 @@ export default function DashboardPage() {
       <div className="grid lg:grid-cols-3 gap-6">
         <Panel title={t('topArtists')}>
           <ul className="space-y-2 text-sm">
-            {(data.artists?.items || []).slice(0, 8).map((a) => (
-              <li key={a.id} className="flex justify-between">
-                <span>{a.name}</span>
-                <span className="text-muted-foreground">{a.popularity ?? '-'}</span>
+            {(data.artists?.items || []).slice(0, 8).map((a, index) => (
+              <li key={a.id} className="flex items-center justify-between gap-3">
+                <span className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-glass-border bg-secondary/30 text-xs font-semibold text-foreground">
+                  {a.position ?? index + 1}
+                </span>
+                <span className="flex-1">{a.name}</span>
+                <span className="text-muted-foreground text-xs">
+                  {a.score != null ? `score ${a.score.toFixed(1)}` : a.popularity ?? '-'}
+                </span>
               </li>
             ))}
           </ul>
@@ -241,9 +262,14 @@ export default function DashboardPage() {
 
         <Panel title={t('topTracks')}>
           <ul className="space-y-2 text-sm">
-            {(data.tracks?.items || []).slice(0, 8).map((t) => (
+            {(data.tracks?.items || []).slice(0, 8).map((t, index) => (
               <li key={t.id} className="space-y-1">
-                <div>{t.name}</div>
+                <div className="flex items-center gap-3">
+                  <span className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-glass-border bg-secondary/30 text-xs font-semibold text-foreground">
+                    {index + 1}
+                  </span>
+                  <span className="flex-1">{t.name}</span>
+                </div>
                 <div className="text-muted-foreground text-xs">{(t.artists || []).map((a) => a.name).join(', ')}</div>
               </li>
             ))}
@@ -254,7 +280,12 @@ export default function DashboardPage() {
           <ul className="space-y-2 text-sm">
             {(data.recent?.items || []).slice(0, 8).map((r, idx) => (
               <li key={`${r.track?.id || idx}-${idx}`} className="space-y-1">
-                <div>{r.track?.name || '-'}</div>
+                <div className="flex items-center gap-3">
+                  <span className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-glass-border bg-secondary/30 text-xs font-semibold text-foreground">
+                    {idx + 1}
+                  </span>
+                  <span className="flex-1">{r.track?.name || '-'}</span>
+                </div>
                 <div className="text-muted-foreground text-xs">{new Date(r.played_at).toLocaleString()}</div>
               </li>
             ))}

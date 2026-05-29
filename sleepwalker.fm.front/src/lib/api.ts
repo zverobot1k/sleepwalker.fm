@@ -1,4 +1,8 @@
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8080').replace(/\/+$/, '');
+const API_BASE = (
+  process.env.NEXT_PUBLIC_API_URL ||
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  'http://localhost:8080'
+).replace(/\/+$/, '');
 
 export type ApiWarning = { warning?: string; source?: string };
 
@@ -17,6 +21,8 @@ export type Artist = {
   genres?: string[];
   images?: Image[];
   external_urls?: ExternalURLs;
+  position?: number;
+  score?: number;
 };
 
 export type SimpleArtist = {
@@ -51,6 +57,7 @@ export type TopArtistsResponse = {
   items: Artist[];
   total?: number;
   limit?: number;
+  source?: string;
 };
 
 export type TopTracksResponse = {
@@ -89,7 +96,7 @@ export type WrappedSummaryResponse = {
   time_range?: string;
   top_artists: Artist[];
   top_tracks: Track[];
-  top_genres: Array<{ genre: string; count: number }>;
+  top_genres: Array<{ genre: string; count: number; weight?: number }>;
   recent_plays_count?: number;
   recent_minutes_total?: number;
   unique_tracks_recent?: number;
@@ -140,7 +147,8 @@ export type StatsProfileResponse = {
 
 export type StatsGenresResponse = {
   time_range?: string;
-  genres: Array<{ genre: string; count: number }>;
+  genres: Array<{ genre: string; count: number; weight?: number }>;
+  source?: string;
   warning?: string;
 };
 
@@ -160,6 +168,13 @@ export type RecommendationsResponse = {
   warning?: string;
   seed_track_ids?: string[];
   seed_artist_ids?: string[];
+};
+
+export type SessionStateResponse = {
+  user_id: string;
+  expires_at: string;
+  scope?: string;
+  connected: boolean;
 };
 
 export type CreatePlaylistResponse = {
@@ -210,6 +225,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  session: (userId: string) =>
+    request<SessionStateResponse>(`/auth/session/${encodeURIComponent(userId)}`),
+
+  refreshTokens: (userId: string) =>
+    request<{ user_id: string; expires_at: string }>(
+      `/auth/refresh/${encodeURIComponent(userId)}`,
+      { method: 'POST' },
+    ),
+
   topArtists: (userId: string, timeRange = 'medium_term', limit = 12) =>
     request<TopArtistsResponse>(
       `/api/spotify/top/artists/${encodeURIComponent(userId)}${buildQuery({ time_range: timeRange, limit })}`,

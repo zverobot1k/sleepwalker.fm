@@ -1,14 +1,16 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
-	"net/http"
-	"net/url"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"sleepwalker.fm/internal/repository/postgres"
 )
 
 const (
@@ -23,8 +25,9 @@ const (
 	recencyMidWeight   = 3.0
 	recencyLowWeight   = 1.0
 
-	maxArtistBatchSize      = 50
 	maxRelatedArtistLookups = 4
+	artistMetadataTTL       = 30 * 24 * time.Hour
+	artistMetadataRefresh   = 30 * time.Minute
 )
 
 type affinityInputs struct {
@@ -57,6 +60,22 @@ type relatedArtistsCache struct {
 	mu    sync.Mutex
 	ttl   time.Duration
 	items map[string]relatedArtistsCacheEntry
+}
+
+type artistMetadataEntry struct {
+	artistID       string
+	genres         []string
+	inferredGenres []string
+	relatedArtists []string
+	source         string
+	expiresAt      time.Time
+	updatedAt      time.Time
+}
+
+type artistMetadataCache struct {
+	mu    sync.Mutex
+	ttl   time.Duration
+	items map[string]artistMetadataEntry
 }
 
 func newArtistCache(ttl time.Duration) *artistCache {
@@ -105,6 +124,31 @@ func (c *relatedArtistsCache) set(id string, artists []ArtistItem) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.items[id] = relatedArtistsCacheEntry{artists: artists, expiresAt: time.Now().Add(c.ttl)}
+}
+
+func newArtistMetadataCache(ttl time.Duration) *artistMetadataCache {
+	return &artistMetadataCache{ttl: ttl, items: make(map[string]artistMetadataEntry)}
+}
+
+func (c *artistMetadataCache) get(id string) (artistMetadataEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.items[id]
+	if !ok {
+		return artistMetadataEntry{}, false
+	}
+	if time.Now().After(entry.expiresAt) {
+		delete(c.items, id)
+		return artistMetadataEntry{}, false
+	}
+	return entry, true
+}
+
+func (c *artistMetadataCache) set(entry artistMetadataEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry.expiresAt = time.Now().Add(c.ttl)
+	c.items[entry.artistID] = entry
 }
 
 func computeAffinityScores(inputs affinityInputs) map[string]float64 {
@@ -421,6 +465,67 @@ func inferGenresFromRelatedArtists(related []ArtistItem, topN int) []string {
 	return genres
 }
 
+func inferGenresFromTagCounts(tags []string, topN int) []string {
+	if len(tags) == 0 || topN <= 0 {
+		return []string{}
+	}
+	counts := map[string]int{}
+	for _, tag := range tags {
+		normalized := strings.TrimSpace(strings.ToLower(tag))
+		if normalized == "" {
+			continue
+		}
+		counts[normalized]++
+	}
+	type genreCount struct {
+		name  string
+		count int
+	}
+	items := make([]genreCount, 0, len(counts))
+	for name, count := range counts {
+		items = append(items, genreCount{name: name, count: count})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].count == items[j].count {
+			return items[i].name < items[j].name
+		}
+		return items[i].count > items[j].count
+	})
+	if len(items) > topN {
+		items = items[:topN]
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		result = append(result, item.name)
+	}
+	return result
+}
+
+func safeStrings(values []string) []string {
+	return uniqueNonEmptyStrings(values)
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func mergeWarnings(parts ...string) string {
+	return compactWarnings(parts)
+}
+
 func compactWarnings(warnings []string) string {
 	seen := map[string]struct{}{}
 	filtered := make([]string, 0, len(warnings))
@@ -436,6 +541,117 @@ func compactWarnings(warnings []string) string {
 		filtered = append(filtered, value)
 	}
 	return strings.Join(filtered, "; ")
+}
+
+func (h *SpotifyAPIHandler) getArtistMetadataCached(ctx context.Context, artistID string, artistName string, accessToken string) (artistMetadataEntry, error) {
+	if artistID == "" {
+		return artistMetadataEntry{}, fmt.Errorf("missing artist id")
+	}
+	if h.artistMetadataCache != nil {
+		if cached, ok := h.artistMetadataCache.get(artistID); ok {
+			return cached, nil
+		}
+	}
+	if h.artistMetadataRepo != nil {
+		if record, ok, err := h.artistMetadataRepo.GetByArtistID(ctx, artistID); err == nil && ok {
+			entry := artistMetadataEntry{
+				artistID:       record.ArtistID,
+				genres:         uniqueNonEmptyStrings(record.Genres),
+				inferredGenres: uniqueNonEmptyStrings(record.InferredGenres),
+				relatedArtists: uniqueNonEmptyStrings(record.RelatedArtists),
+				source:         record.Source,
+				updatedAt:      record.UpdatedAt,
+			}
+			if h.artistMetadataCache != nil {
+				h.artistMetadataCache.set(entry)
+			}
+			return entry, nil
+		}
+	}
+
+	entry, err := h.refreshArtistMetadata(ctx, artistID, artistName, accessToken)
+	if err != nil {
+		return artistMetadataEntry{}, err
+	}
+	if h.artistMetadataCache != nil {
+		h.artistMetadataCache.set(entry)
+	}
+	return entry, nil
+}
+
+func (h *SpotifyAPIHandler) refreshArtistMetadata(ctx context.Context, artistID string, artistName string, accessToken string) (artistMetadataEntry, error) {
+	entry := artistMetadataEntry{artistID: artistID, source: "cache_miss", updatedAt: time.Now()}
+	artist, err := h.fetchArtistByID(nil, accessToken, artistID)
+	if err != nil {
+		return entry, err
+	}
+	entry.genres = safeStrings(artist.Genres)
+	entry.source = "spotify_single_artist"
+	if len(entry.genres) == 0 && h.lastfmClient != nil && h.lastfmClient.Enabled() {
+		lastfmGenres, lastfmErr := h.lastfmClient.GetArtistTopTags(ctx, chooseArtistName(artistName, artist.Name), 10)
+		if lastfmErr == nil {
+			entry.genres = safeStrings(lastfmGenres)
+			entry.source = "lastfm_top_tags"
+		} else {
+			entry.source = "spotify_single_artist"
+		}
+	}
+	if len(entry.genres) == 0 && h.lastfmClient != nil && h.lastfmClient.Enabled() {
+		similar, similarErr := h.lastfmClient.GetArtistSimilar(ctx, chooseArtistName(artistName, artist.Name), 10)
+		if similarErr == nil {
+			similarNames := make([]string, 0, len(similar))
+			for _, item := range similar {
+				similarNames = append(similarNames, item.Name)
+			}
+			entry.relatedArtists = safeStrings(similarNames)
+			entry.inferredGenres = inferGenresFromTagCounts(similarNames, 5)
+			if len(entry.inferredGenres) > 0 {
+				entry.source = "lastfm_similar_artists"
+			}
+		}
+	}
+	if len(entry.inferredGenres) == 0 && len(entry.relatedArtists) > 0 {
+		entry.inferredGenres = inferGenresFromTagCounts(entry.relatedArtists, 5)
+	}
+	if h.artistMetadataRepo != nil {
+		_ = h.artistMetadataRepo.Upsert(ctx, postgres.ArtistMetadataRecord{
+			ArtistID:       entry.artistID,
+			Genres:         entry.genres,
+			InferredGenres: entry.inferredGenres,
+			RelatedArtists: entry.relatedArtists,
+			Source:         entry.source,
+			UpdatedAt:      time.Now(),
+		})
+	}
+	return entry, nil
+}
+
+func chooseArtistName(preferred string, fallback string) string {
+	preferred = strings.TrimSpace(preferred)
+	if preferred != "" {
+		return preferred
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func (h *SpotifyAPIHandler) enrichTopArtistsAsync(accessToken string, items []ArtistItem) {
+	if h == nil || len(items) == 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		for _, item := range items {
+			if item.ID == "" {
+				continue
+			}
+			metadata, err := h.getArtistMetadataCached(ctx, item.ID, item.Name, accessToken)
+			if err != nil {
+				continue
+			}
+			_ = metadata
+		}
+	}()
 }
 
 func (h *SpotifyAPIHandler) getArtistDetailsCached(accessToken string, artistIDs []string) (map[string]ArtistItem, error) {
@@ -456,51 +672,17 @@ func (h *SpotifyAPIHandler) getArtistDetailsCached(accessToken string, artistIDs
 	}
 
 	var fetchErr error
-	skipIndividual := false
-	for start := 0; start < len(missing); start += maxArtistBatchSize {
-		end := start + maxArtistBatchSize
-		if end > len(missing) {
-			end = len(missing)
-		}
-		chunk := missing[start:end]
-		artists, err := h.fetchArtistsBatch(accessToken, chunk)
+	for _, id := range missing {
+		artist, err := h.fetchArtistByID(nil, accessToken, id)
 		if err != nil {
-			fetchErr = err
-			if isSpotifyRateLimited(err) {
-				skipIndividual = true
-				break
+			if fetchErr == nil {
+				fetchErr = err
 			}
 			continue
 		}
-		for _, artist := range artists {
-			if artist.ID == "" {
-				continue
-			}
-			result[artist.ID] = artist
-			if h.artistCache != nil {
-				h.artistCache.set(artist.ID, artist)
-			}
-		}
-	}
-
-	stillMissing := make([]string, 0)
-	for _, id := range missing {
-		if _, ok := result[id]; !ok {
-			stillMissing = append(stillMissing, id)
-		}
-	}
-
-	if len(stillMissing) > 0 && !skipIndividual {
-		client := &http.Client{}
-		detailsByID, err := h.fetchArtistsDetailsIndividually(client, accessToken, stillMissing)
-		if err != nil && fetchErr == nil {
-			fetchErr = err
-		}
-		for id, artist := range detailsByID {
-			result[id] = artist
-			if h.artistCache != nil {
-				h.artistCache.set(id, artist)
-			}
+		result[id] = artist
+		if h.artistCache != nil {
+			h.artistCache.set(id, artist)
 		}
 	}
 
@@ -509,37 +691,6 @@ func (h *SpotifyAPIHandler) getArtistDetailsCached(accessToken string, artistIDs
 	}
 
 	return result, fetchErr
-}
-
-func (h *SpotifyAPIHandler) fetchArtistsBatch(accessToken string, artistIDs []string) ([]ArtistItem, error) {
-	if len(artistIDs) == 0 {
-		return []ArtistItem{}, nil
-	}
-
-	query := url.Values{}
-	query.Set("ids", strings.Join(artistIDs, ","))
-	body, err := h.doSpotifyGETWithAppFallback(accessToken, "https://api.spotify.com/v1/artists?"+query.Encode())
-	if err != nil {
-		return nil, err
-	}
-
-	var payload struct {
-		Artists []ArtistItem `json:"artists"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, err
-	}
-
-	for i := range payload.Artists {
-		if payload.Artists[i].Genres == nil {
-			payload.Artists[i].Genres = []string{}
-		}
-		if payload.Artists[i].ExternalURLs == nil {
-			payload.Artists[i].ExternalURLs = make(map[string]string)
-		}
-	}
-
-	return payload.Artists, nil
 }
 
 func (h *SpotifyAPIHandler) getRelatedArtistsCached(accessToken string, artistID string) ([]ArtistItem, error) {
@@ -622,7 +773,7 @@ func (h *SpotifyAPIHandler) buildSeedGenres(accessToken string, artistIDs []stri
 	sampleIDs := pickFirstIDs(artistIDs, 8)
 	artistDetails, err := h.getArtistDetailsCached(accessToken, sampleIDs)
 	if err != nil {
-		warnings = append(warnings, "artist genre lookup degraded")
+		warnings = append(warnings, "artist metadata lookup degraded")
 	}
 
 	artists := make([]ArtistItem, 0, len(sampleIDs))
@@ -631,17 +782,18 @@ func (h *SpotifyAPIHandler) buildSeedGenres(accessToken string, artistIDs []stri
 		if !ok {
 			continue
 		}
-		if len(artist.Genres) == 0 {
-			inferred, inferWarn := h.inferGenresWithRelated(accessToken, id, 3)
-			if inferWarn != "" {
-				warnings = append(warnings, inferWarn)
+		metadata, metaErr := h.getArtistMetadataCached(context.Background(), id, artist.Name, accessToken)
+		if metaErr == nil {
+			if len(metadata.genres) > 0 {
+				artist.Genres = metadata.genres
+			} else if len(metadata.inferredGenres) > 0 {
+				artist.Genres = metadata.inferredGenres
 			}
-			if len(inferred) > 0 {
-				artist.Genres = inferred
-				if h.artistCache != nil {
-					h.artistCache.set(id, artist)
-				}
+			if len(metadata.relatedArtists) > 0 {
+				warnings = append(warnings, "related artists available for genre inference")
 			}
+		} else if len(artist.Genres) == 0 {
+			warnings = append(warnings, "artist metadata lookup failed")
 		}
 		artists = append(artists, artist)
 	}
@@ -656,18 +808,15 @@ func (h *SpotifyAPIHandler) buildSeedGenres(accessToken string, artistIDs []stri
 }
 
 func (h *SpotifyAPIHandler) inferGenresWithRelated(accessToken string, artistID string, topN int) ([]string, string) {
-	related, err := h.getRelatedArtistsCached(accessToken, artistID)
-	if err != nil {
-		return []string{}, "related artists lookup failed"
+	if artistID == "" {
+		return []string{}, "artist id missing"
 	}
-	if len(related) == 0 {
-		return []string{}, "related artists empty for genre inference"
+	if h.artistMetadataRepo != nil {
+		if record, ok, err := h.artistMetadataRepo.GetByArtistID(context.Background(), artistID); err == nil && ok && len(record.InferredGenres) > 0 {
+			return pickFirstIDs(record.InferredGenres, topN), ""
+		}
 	}
-	inferred := inferGenresFromRelatedArtists(related, topN)
-	if len(inferred) == 0 {
-		return []string{}, "related artists had no genres"
-	}
-	return inferred, ""
+	return []string{}, "related artists unavailable"
 }
 
 func (h *SpotifyAPIHandler) buildAudioProfileFromInputs(accessToken string, inputs affinityInputs) (audioProfile, string) {

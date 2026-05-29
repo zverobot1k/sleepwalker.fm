@@ -41,6 +41,8 @@ func NewRouter(deps RouterDeps) *gin.Engine {
 		auth.GET("/callback", deps.OAuth.Callback)
 		auth.POST("/refresh/:userId", deps.OAuth.Refresh)
 	}
+	r.POST("/auth/refresh/:userId", deps.OAuth.Refresh)
+	r.GET("/auth/session/:userId", deps.OAuth.Session)
 
 	api := r.Group("/api/spotify")
 	{

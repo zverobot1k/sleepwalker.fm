@@ -1,0 +1,8 @@
+.git
+.env
+**/.env
+sleepwalker.fm.front/node_modules
+sleepwalker.fm.front/.next
+sleepwalker.fm.front/dist
+**/node_modules
+**/.next
