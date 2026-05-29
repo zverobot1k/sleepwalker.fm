@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -54,13 +55,15 @@ func (s *OAuthService) StartLogin(ctx context.Context) (string, error) {
 	params := url.Values{}
 	params.Set("response_type", "code")
 	params.Set("client_id", s.cfg.SpotifyClientID)
-	params.Set("redirect_uri", s.cfg.SpotifyRedirectURI)
+	redirectURI := strings.TrimSpace(s.cfg.SpotifyRedirectURI)
+	params.Set("redirect_uri", redirectURI)
 	params.Set("scope", strings.Join(s.cfg.SpotifyScopes, " "))
 	params.Set("state", state)
 	params.Set("code_challenge_method", "S256")
 	params.Set("code_challenge", challenge)
 
 	authURL := s.cfg.SpotifyAuthorizeURL + "?" + params.Encode()
+	log.Printf("spotify oauth: authorization request redirect_uri=%q (encoded in URL)", redirectURI)
 	return authURL, nil
 }
 
@@ -153,10 +156,12 @@ func (s *OAuthService) exchangeToken(ctx context.Context, code, verifier string)
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
-	form.Set("redirect_uri", s.cfg.SpotifyRedirectURI)
+	redirectURI := strings.TrimSpace(s.cfg.SpotifyRedirectURI)
+	form.Set("redirect_uri", redirectURI)
 	form.Set("client_id", s.cfg.SpotifyClientID)
 	form.Set("code_verifier", verifier)
 
+	log.Printf("spotify oauth: token exchange redirect_uri=%q", redirectURI)
 	resp, err := s.httpClient.PostForm(s.cfg.SpotifyTokenURL, form)
 	if err != nil {
 		return tokenResponse{}, err

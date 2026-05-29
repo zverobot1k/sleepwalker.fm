@@ -3,15 +3,18 @@
 import { useState } from 'react';
 import { api } from '@/lib/api';
 import { useSession } from '@/hooks/use-session';
-import { ErrorState, LoadingState, WarningState } from '@/components/ui-state';
+import { ErrorState, LoadingState } from '@/components/ui-state';
+import { useI18n } from '@/components/providers/i18n-provider';
+import { PlaylistExportResult } from '@/components/playlist-export';
 
 export default function PlaylistPage() {
   const session = useSession();
+  const { t } = useI18n();
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<Awaited<ReturnType<typeof api.createPlaylist>> | null>(null);
 
-  if (!session?.userId) return <LoadingState />;
+  if (!session?.userId) return <LoadingState text={t('loading')} />;
 
   const create = async () => {
     setCreating(true);
@@ -20,7 +23,7 @@ export default function PlaylistPage() {
       const response = await api.createPlaylist(session.userId, 20);
       setResult(response);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to create playlist');
+      setError(e instanceof Error ? e.message : t('failedPlaylist'));
     } finally {
       setCreating(false);
     }
@@ -28,31 +31,27 @@ export default function PlaylistPage() {
 
   return (
     <div className="space-y-6 max-w-3xl">
-      <h1 className="text-4xl font-bold bg-gradient-to-r from-violet-200 to-indigo-200 bg-clip-text text-transparent">Playlist Export</h1>
+      <h1 className="text-4xl font-bold bg-gradient-to-r from-violet-200 to-indigo-200 bg-clip-text text-transparent">
+        {t('playlist')}
+      </h1>
 
       <button
         onClick={create}
         disabled={creating}
         className="px-6 py-3 rounded-lg bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:opacity-50"
       >
-        {creating ? 'Creating...' : 'Create playlist from recommendations'}
+        {creating ? t('creating') : t('createPlaylist')}
       </button>
 
       {error && <ErrorState message={error} />}
-      {result?.warning && <WarningState text={result.warning} />}
 
       {result?.playlist_url && (
         <a href={result.playlist_url} target="_blank" rel="noreferrer" className="inline-block text-violet-300 underline">
-          Open created playlist in Spotify
+          {t('openPlaylist')}
         </a>
       )}
 
-      {!!result?.fallback_uris?.length && (
-        <div className="p-4 rounded-xl border border-glass-border bg-glass-bg">
-          <p className="text-sm text-muted-foreground mb-2">Spotify playlist creation unavailable. Use fallback URIs:</p>
-          <pre className="text-xs overflow-x-auto whitespace-pre-wrap">{result.fallback_uris.join('\n')}</pre>
-        </div>
-      )}
+      {result && <PlaylistExportResult result={result} />}
     </div>
   );
 }

@@ -4,8 +4,10 @@ import { useEffect, useMemo, useState } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, RadarChart, Radar, PolarGrid, PolarAngleAxis } from 'recharts';
 import { api } from '@/lib/api';
 import { useSession } from '@/hooks/use-session';
-import { EmptyState, ErrorState, LoadingState, WarningState } from '@/components/ui-state';
+import { EmptyState, ErrorState, LoadingState } from '@/components/ui-state';
 import { useI18n } from '@/components/providers/i18n-provider';
+import { InfoBanner } from '@/components/info-banner';
+import { resolveNotice, resolveReason, resolveSourceLabel } from '@/lib/notices';
 
 type DashboardData = {
   artists: Awaited<ReturnType<typeof api.topArtists>> | null;
@@ -23,10 +25,10 @@ const colors = ['#8b5cf6', '#6366f1', '#a78bfa', '#c4b5fd', '#7c3aed', '#4f46e5'
 
 export default function DashboardPage() {
   const session = useSession();
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [warnings, setWarnings] = useState<string[]>([]);
+  const [partialNotice, setPartialNotice] = useState(false);
   const [data, setData] = useState<DashboardData>({
     artists: null,
     tracks: null,
@@ -46,19 +48,8 @@ export default function DashboardPage() {
     (async () => {
       setLoading(true);
       setError(null);
-      setWarnings([]);
+      setPartialNotice(false);
       try {
-        const labels = [
-          'Top artists',
-          'Top tracks',
-          'Recently played',
-          'Genre stats',
-          'Listening timeline',
-          'Listening time',
-          'Audio features',
-          'Wrapped summary',
-          'Recommendations',
-        ];
         const results = await Promise.allSettled([
           api.topArtists(session.userId),
           api.topTracks(session.userId),
@@ -72,19 +63,17 @@ export default function DashboardPage() {
         ]);
 
         if (!mounted) return;
-        const failures = results
-          .map((result, idx) => {
-            if (result.status === 'fulfilled') return null;
-            const message = result.reason instanceof Error ? result.reason.message : 'Request failed';
-            return `${labels[idx]}: ${message}`;
-          })
-          .filter((value): value is string => Boolean(value));
 
         const anySuccess = results.some((result) => result.status === 'fulfilled');
+        const anyFailure = results.some((result) => result.status === 'rejected');
         if (!anySuccess) {
-          setError(failures[0] || 'Failed to load dashboard');
-        } else {
-          setWarnings(failures);
+          const first = results.find((r) => r.status === 'rejected');
+          const message = first?.status === 'rejected' && first.reason instanceof Error
+            ? first.reason.message
+            : t('failedDashboard');
+          setError(message);
+        } else if (anyFailure) {
+          setPartialNotice(true);
         }
 
         const valueOrNull = <T,>(result: PromiseSettledResult<T>) =>
@@ -103,7 +92,7 @@ export default function DashboardPage() {
         });
       } catch (e) {
         if (!mounted) return;
-        setError(e instanceof Error ? e.message : 'Failed to load dashboard');
+        setError(e instanceof Error ? e.message : t('failedDashboard'));
       } finally {
         if (mounted) setLoading(false);
       }
@@ -112,7 +101,7 @@ export default function DashboardPage() {
     return () => {
       mounted = false;
     };
-  }, [session?.userId]);
+  }, [session?.userId, t]);
 
   const avgAudio = useMemo(() => {
     const items = data.audio?.audio_features || [];
@@ -127,11 +116,21 @@ export default function DashboardPage() {
     );
 
     return [
-      { metric: 'Danceability', value: totals.danceability / items.length },
-      { metric: 'Energy', value: totals.energy / items.length },
-      { metric: 'Valence', value: totals.valence / items.length },
+      { metric: t('metricDanceability'), value: totals.danceability / items.length },
+      { metric: t('metricEnergy'), value: totals.energy / items.length },
+      { metric: t('metricValence'), value: totals.valence / items.length },
     ];
-  }, [data.audio]);
+  }, [data.audio, t]);
+
+  const infoNotices = useMemo(() => {
+    const notices = [
+      resolveNotice(lang, data.audio?.notice, data.audio?.warning),
+      resolveNotice(lang, data.recs?.notice, data.recs?.warning),
+      resolveNotice(lang, data.genres?.notice, data.genres?.warning),
+      partialNotice ? t('partialLoad') : null,
+    ].filter((n): n is string => Boolean(n));
+    return [...new Set(notices)];
+  }, [lang, data.audio, data.recs, data.genres, partialNotice, t]);
 
   if (!session?.userId) return <LoadingState text={t('loading')} />;
   if (loading) return <LoadingState text={t('loading')} />;
@@ -148,14 +147,11 @@ export default function DashboardPage() {
         <Metric title={t('listeningTime')} value={`${Math.round(data.listening?.hours || 0)}h`} />
       </div>
 
-      {(warnings.length > 0 || data.audio?.warning || data.recs?.warning || data.wrapped?.warning) && (
+      {infoNotices.length > 0 && (
         <div className="space-y-2">
-          {warnings.map((warning, idx) => (
-            <WarningState key={`${warning}-${idx}`} text={warning} />
+          {infoNotices.map((text) => (
+            <InfoBanner key={text} text={text} />
           ))}
-          {data.audio?.warning && <WarningState text={`${t('warning')}: ${data.audio.warning}`} />}
-          {data.recs?.warning && <WarningState text={`${t('warning')}: ${data.recs.warning}`} />}
-          {data.wrapped?.warning && <WarningState text={`${t('warning')}: ${data.wrapped.warning}`} />}
         </div>
       )}
 
@@ -198,7 +194,7 @@ export default function DashboardPage() {
 
         <Panel title={t('audioFeatures')}>
           {!avgAudio ? (
-            <EmptyState text={t('fallback')} />
+            <EmptyState text={t('empty')} />
           ) : (
             <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
@@ -218,26 +214,36 @@ export default function DashboardPage() {
             <EmptyState text={t('empty')} />
           ) : (
             <div className="space-y-3 text-sm text-muted-foreground">
-              <p>Top artists: {(data.wrapped.top_artists || []).slice(0, 3).map((a) => a.name).join(', ') || '-'}</p>
-              <p>Top tracks: {(data.wrapped.top_tracks || []).slice(0, 3).map((t) => t.name).join(', ') || '-'}</p>
-              <p>Top genres (Last.fm): {(data.wrapped.top_genres || []).slice(0, 3).map((g) => g.genre).join(', ') || '-'}</p>
-              <p>Recent plays: {data.wrapped.recent_plays_count ?? '-'}</p>
+              <p>
+                {t('topArtistsLabel')}: {(data.wrapped.top_artists || []).slice(0, 3).map((a) => a.name).join(', ') || '—'}
+              </p>
+              <p>
+                {t('topTracksLabel')}: {(data.wrapped.top_tracks || []).slice(0, 3).map((tr) => tr.name).join(', ') || '—'}
+              </p>
+              <p>
+                {t('topGenresLastFm')}: {(data.wrapped.top_genres || []).slice(0, 3).map((g) => g.genre).join(', ') || '—'}
+              </p>
+              <p>
+                {t('recentPlays')}: {data.wrapped.recent_plays_count ?? '—'}
+              </p>
             </div>
           )}
         </Panel>
 
-        <Panel title="Recommendations">
+        <Panel title={t('recommendationsPanel')}>
           {!data.recs?.items?.length ? (
-            <EmptyState text={data.recs?.source === 'top_tracks_fallback' ? 'Fallback: top tracks' : t('empty')} />
+            <EmptyState text={t('empty')} />
           ) : (
             <ul className="space-y-2 text-sm">
               {data.recs.items.slice(0, 5).map((item, idx) => (
                 <li key={`${item.track?.id || idx}`}>
                   <span className="font-medium">{item.track?.name}</span>
-                  <span className="text-muted-foreground text-xs block">{item.reason}</span>
+                  <span className="text-muted-foreground text-xs block">{resolveReason(lang, item.reason)}</span>
                 </li>
               ))}
-              <li className="text-xs text-muted-foreground pt-1">Source: {data.recs.source}</li>
+              <li className="text-xs text-muted-foreground pt-1">
+                {t('source')}: {resolveSourceLabel(lang, data.recs.source)}
+              </li>
             </ul>
           )}
         </Panel>
@@ -253,7 +259,7 @@ export default function DashboardPage() {
                 </span>
                 <span className="flex-1">{a.name}</span>
                 <span className="text-muted-foreground text-xs">
-                  {a.score != null ? `score ${a.score.toFixed(1)}` : a.popularity ?? '-'}
+                  {a.score != null ? `${t('score')} ${a.score.toFixed(1)}` : a.popularity ?? '—'}
                 </span>
               </li>
             ))}
@@ -262,15 +268,15 @@ export default function DashboardPage() {
 
         <Panel title={t('topTracks')}>
           <ul className="space-y-2 text-sm">
-            {(data.tracks?.items || []).slice(0, 8).map((t, index) => (
-              <li key={t.id} className="space-y-1">
+            {(data.tracks?.items || []).slice(0, 8).map((track, index) => (
+              <li key={track.id} className="space-y-1">
                 <div className="flex items-center gap-3">
                   <span className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-glass-border bg-secondary/30 text-xs font-semibold text-foreground">
                     {index + 1}
                   </span>
-                  <span className="flex-1">{t.name}</span>
+                  <span className="flex-1">{track.name}</span>
                 </div>
-                <div className="text-muted-foreground text-xs">{(t.artists || []).map((a) => a.name).join(', ')}</div>
+                <div className="text-muted-foreground text-xs">{(track.artists || []).map((a) => a.name).join(', ')}</div>
               </li>
             ))}
           </ul>
@@ -284,7 +290,7 @@ export default function DashboardPage() {
                   <span className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-glass-border bg-secondary/30 text-xs font-semibold text-foreground">
                     {idx + 1}
                   </span>
-                  <span className="flex-1">{r.track?.name || '-'}</span>
+                  <span className="flex-1">{r.track?.name || '—'}</span>
                 </div>
                 <div className="text-muted-foreground text-xs">{new Date(r.played_at).toLocaleString()}</div>
               </li>

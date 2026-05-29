@@ -184,18 +184,29 @@ type RecommendationsResponse struct {
 	Mode          string               `json:"mode"`
 	Items         []RecommendationItem `json:"items"`
 	Source        string               `json:"source"`
-	Warning       string               `json:"warning,omitempty"`
+	Notice        string               `json:"notice,omitempty"`
+	Warning       string               `json:"warning,omitempty"` // deprecated: use notice
 	SeedTrackIDs  []string             `json:"seed_track_ids"`
 	SeedArtistIDs []string             `json:"seed_artist_ids"`
 	SeedGenres    []string             `json:"seed_genres,omitempty"`
 }
 
+type ExportTrack struct {
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Artists    []string `json:"artists"`
+	URI        string   `json:"uri"`
+	SpotifyURL string   `json:"spotify_url,omitempty"`
+}
+
 type CreatePlaylistResponse struct {
-	PlaylistID   string   `json:"playlist_id,omitempty"`
-	PlaylistURL  string   `json:"playlist_url,omitempty"`
-	TracksAdded  int      `json:"tracks_added"`
-	Warning      string   `json:"warning,omitempty"`
-	FallbackURIs []string `json:"fallback_uris,omitempty"`
+	PlaylistID     string        `json:"playlist_id,omitempty"`
+	PlaylistURL    string        `json:"playlist_url,omitempty"`
+	TracksAdded    int           `json:"tracks_added"`
+	Notice         string        `json:"notice,omitempty"`
+	Warning        string        `json:"warning,omitempty"` // deprecated: use notice
+	FallbackURIs   []string      `json:"fallback_uris,omitempty"`
+	FallbackTracks []ExportTrack `json:"fallback_tracks,omitempty"`
 }
 
 // SpotifyAPIHandler — обработчик для вызовов Spotify API
@@ -507,7 +518,7 @@ func (h *SpotifyAPIHandler) GetAudioFeatures(c *gin.Context) {
 			log.Printf("audio-features unavailable (%v); returning %d derived feature rows", err, len(derived))
 			c.JSON(http.StatusOK, gin.H{
 				"audio_features": derived,
-				"warning":        "spotify audio-features API unavailable (" + err.Error() + "); metrics derived from track popularity and duration",
+				"notice":         NoticeAudioFeaturesEstimated,
 				"source":         "derived",
 			})
 			return
@@ -519,7 +530,7 @@ func (h *SpotifyAPIHandler) GetAudioFeatures(c *gin.Context) {
 	if len(result.AudioFeatures) == 0 && len(topTracksForProxy) > 0 {
 		c.JSON(http.StatusOK, gin.H{
 			"audio_features": deriveAudioFeaturesFromTracks(topTracksForProxy),
-			"warning":        "spotify returned no audio features; metrics derived from track popularity and duration",
+			"notice":         NoticeAudioFeaturesEstimated,
 			"source":         "derived",
 		})
 		return
@@ -919,8 +930,8 @@ func (h *SpotifyAPIHandler) GetStatsProfile(c *gin.Context) {
 
 	features, err := h.fetchAudioFeaturesFromSpotify(accessToken, collectTrackIDs(topTracks.Items))
 	if err != nil {
-		if isSpotifyForbidden(err) {
-			resp.Warning = "audio-features unavailable: spotify returned 403"
+		if isSpotifyForbidden(err) || isSpotifyNotFound(err) {
+			log.Printf("stats profile: audio-features restricted: %v", err)
 			c.JSON(http.StatusOK, resp)
 			return
 		}
@@ -999,8 +1010,8 @@ func (h *SpotifyAPIHandler) GetStatsGenres(c *gin.Context) {
 		"genres":     genres,
 		"source":     "lastfm",
 	}
-	if warning != "" {
-		resp["warning"] = warning
+	if notice := mapGenreWarningToNotice(warning); notice != "" {
+		resp["notice"] = notice
 	}
 
 	c.JSON(http.StatusOK, resp)
@@ -1123,35 +1134,26 @@ func (h *SpotifyAPIHandler) GetRecommendations(c *gin.Context) {
 		}
 
 		if recs, ok := h.recommendViaLastFM(ctx, accessToken, snapshot, stats, seedArtists, mode, limit); ok {
-			if genreWarn != "" {
-				recs.Warning = mergeWarnings(recs.Warning, genreWarn)
-			}
 			if recErr != nil {
-				recs.Warning = mergeWarnings(recs.Warning, recErr.Error())
+				recs.Notice = NoticeRecommendationsListening
 			}
+			_ = genreWarn
 			c.JSON(http.StatusOK, recs)
 			return
 		}
 
 		fallback, fbErr := h.fallbackRecommendations(ctx, userID, accessToken, limit)
 		if fbErr != nil {
-			warning := "all recommendation strategies failed"
-			if recErr != nil {
-				warning += ": " + recErr.Error()
-			}
+			log.Printf("recommendations: all strategies failed: spotify=%v fallback=%v", recErr, fbErr)
 			c.JSON(http.StatusOK, RecommendationsResponse{
-				Mode:    mode,
-				Items:   []RecommendationItem{},
-				Source:  "recommendations_unavailable",
-				Warning: warning,
+				Mode:   mode,
+				Items:  []RecommendationItem{},
+				Source: "recommendations_unavailable",
+				Notice: NoticeRecommendationsUnavailable,
 			})
 			return
 		}
-		spotifyWarn := ""
-		if recErr != nil {
-			spotifyWarn = recErr.Error()
-		}
-		fallback.Warning = mergeWarnings(fallback.Warning, spotifyWarn, genreWarn, "used top tracks after spotify and last.fm paths failed")
+		fallback.Notice = NoticeRecommendationsTopTracks
 		c.JSON(http.StatusOK, fallback)
 		return
 	}
@@ -1160,17 +1162,16 @@ func (h *SpotifyAPIHandler) GetRecommendations(c *gin.Context) {
 	if err != nil {
 		fallback, fbErr := h.fallbackRecommendations(ctx, userID, accessToken, limit)
 		if fbErr != nil {
-			warning := "spotify recommendations unavailable: " + err.Error()
-			warning += "; fallback failed: " + fbErr.Error()
+			log.Printf("recommendations: fallback failed: spotify=%v fallback=%v", err, fbErr)
 			c.JSON(http.StatusOK, RecommendationsResponse{
-				Mode:    mode,
-				Items:   []RecommendationItem{},
-				Source:  "recommendations_unavailable",
-				Warning: warning,
+				Mode:   mode,
+				Items:  []RecommendationItem{},
+				Source: "recommendations_unavailable",
+				Notice: NoticeRecommendationsUnavailable,
 			})
 			return
 		}
-		fallback.Warning = "spotify recommendations endpoint unavailable, fallback used: " + err.Error()
+		fallback.Notice = NoticeRecommendationsTopTracks
 		c.JSON(http.StatusOK, fallback)
 		return
 	}
@@ -1207,6 +1208,30 @@ func recommendationResultToHandler(result *recommendationservice.Result) Recomme
 		SeedArtistIDs: result.SeedArtistIDs,
 		SeedGenres:    result.SeedGenres,
 	}
+}
+
+func recommendationItemsToExportTracks(items []RecommendationItem) []ExportTrack {
+	out := make([]ExportTrack, 0, len(items))
+	for _, item := range items {
+		artists := make([]string, 0, len(item.Track.Artists))
+		for _, a := range item.Track.Artists {
+			if a.Name != "" {
+				artists = append(artists, a.Name)
+			}
+		}
+		spotifyURL := ""
+		if item.Track.ExternalURLs != nil {
+			spotifyURL = item.Track.ExternalURLs["spotify"]
+		}
+		out = append(out, ExportTrack{
+			ID:         item.Track.ID,
+			Name:       item.Track.Name,
+			Artists:    artists,
+			URI:        item.Track.URI,
+			SpotifyURL: spotifyURL,
+		})
+	}
+	return out
 }
 
 func (h *SpotifyAPIHandler) fallbackRecommendationItems(ctx context.Context, userID, accessToken string, limit int) ([]recommendationservice.Item, error) {
@@ -1261,26 +1286,23 @@ func (h *SpotifyAPIHandler) CreateRecommendationsPlaylist(c *gin.Context) {
 	if err != nil {
 		fallback, fbErr := h.fallbackRecommendations(ctx, userID, accessToken, limit)
 		if fbErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load tracks for export"})
 			return
 		}
-		uris := recommendationURIs(fallback.Items)
-		c.JSON(http.StatusOK, CreatePlaylistResponse{
-			TracksAdded:  0,
-			Warning:      "playlist not created, spotify recommendations unavailable",
-			FallbackURIs: uris,
-		})
+		c.JSON(http.StatusOK, playlistExportFallbackResponse(fallback.Items, NoticePlaylistExportFallback))
 		return
 	}
 
-	playlistID, playlistURL, err := h.createPlaylistWithTracks(accessToken, userID, recommendationURIs(recs.Items))
+	uris := recommendationURIs(recs.Items)
+	playlistID, playlistURL, err := h.createPlaylistWithTracks(accessToken, uris)
 	if err != nil {
-		if isSpotifyForbidden(err) {
-			c.JSON(http.StatusOK, CreatePlaylistResponse{
-				TracksAdded:  0,
-				Warning:      "playlist create/add forbidden for current scopes",
-				FallbackURIs: recommendationURIs(recs.Items),
-			})
+		if isSpotifyForbidden(err) || isSpotifyNotFound(err) {
+			log.Printf("playlist create restricted: %v", err)
+			notice := NoticePlaylistScopesRestricted
+			if strings.Contains(strings.ToLower(err.Error()), "scope") {
+				notice = NoticePlaylistScopesRestricted
+			}
+			c.JSON(http.StatusOK, playlistExportFallbackResponse(recs.Items, notice))
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1290,8 +1312,18 @@ func (h *SpotifyAPIHandler) CreateRecommendationsPlaylist(c *gin.Context) {
 	c.JSON(http.StatusOK, CreatePlaylistResponse{
 		PlaylistID:  playlistID,
 		PlaylistURL: playlistURL,
-		TracksAdded: len(recommendationURIs(recs.Items)),
+		TracksAdded: len(uris),
 	})
+}
+
+func playlistExportFallbackResponse(items []RecommendationItem, notice string) CreatePlaylistResponse {
+	uris := recommendationURIs(items)
+	return CreatePlaylistResponse{
+		TracksAdded:    0,
+		Notice:         notice,
+		FallbackURIs:   uris,
+		FallbackTracks: recommendationItemsToExportTracks(items),
+	}
 }
 
 // fetchTopArtistsFromSpotify — вызов Spotify API
@@ -1685,11 +1717,14 @@ func (h *SpotifyAPIHandler) recommendViaLastFM(
 		}
 	}
 
+	if len(recWarnings) > 0 {
+		log.Printf("recommendations: last.fm track lookup: %s", mergeWarnings(recWarnings...))
+	}
+
 	return &RecommendationsResponse{
 		Mode:          mode,
 		Items:         items,
 		Source:        "lastfm_similar_artists",
-		Warning:       mergeWarnings(recWarnings...),
 		SeedArtistIDs: seedArtistIDs,
 		SeedGenres:    seedGenres,
 	}, true
@@ -1976,12 +2011,10 @@ func (h *SpotifyAPIHandler) fetchRecommendationsFromSpotify(ctx context.Context,
 			}
 
 			if recs, ok := h.recommendViaLastFM(ctx, accessToken, snapshot, stats, seedArtists, mode, limit); ok {
-				if genreWarn != "" {
-					recs.Warning = mergeWarnings(recs.Warning, genreWarn)
-				}
 				if recErr != nil {
-					recs.Warning = mergeWarnings(recs.Warning, recErr.Error())
+					recs.Notice = NoticeRecommendationsListening
 				}
+				_ = genreWarn
 				return recs, nil
 			}
 		}
@@ -2118,29 +2151,30 @@ func (h *SpotifyAPIHandler) fallbackRecommendations(ctx context.Context, userID,
 	}
 	items := make([]RecommendationItem, 0, len(topTracks.Items))
 	for _, t := range topTracks.Items {
-		items = append(items, RecommendationItem{Track: t, Reason: "fallback: based on your top tracks"})
+		items = append(items, RecommendationItem{Track: t, Reason: "top_tracks_fallback"})
 	}
 	return &RecommendationsResponse{
 		Mode:          "comfort",
 		Items:         items,
 		Source:        "top_tracks_fallback",
+		Notice:        NoticeRecommendationsTopTracks,
 		SeedTrackIDs:  pickFirstIDs(collectTrackIDs(topTracks.Items), 5),
 		SeedArtistIDs: []string{},
 	}, nil
 }
 
-func (h *SpotifyAPIHandler) createPlaylistWithTracks(accessToken string, userID string, uris []string) (string, string, error) {
+func (h *SpotifyAPIHandler) createPlaylistWithTracks(accessToken string, uris []string) (string, string, error) {
 	if len(uris) == 0 {
 		return "", "", nil
 	}
 
 	createPayload := map[string]interface{}{
 		"name":        "Sleepwalker Wrapped Picks",
-		"description": "Auto-generated from wrapped recommendations",
+		"description": "Auto-generated from sleepwalker.fm recommendations",
 		"public":      false,
 	}
 	body, _ := json.Marshal(createPayload)
-	req, err := http.NewRequest("POST", "https://api.spotify.com/v1/users/"+userID+"/playlists", strings.NewReader(string(body)))
+	req, err := http.NewRequest("POST", "https://api.spotify.com/v1/me/playlists", strings.NewReader(string(body)))
 	if err != nil {
 		return "", "", err
 	}
@@ -2169,7 +2203,7 @@ func (h *SpotifyAPIHandler) createPlaylistWithTracks(accessToken string, userID 
 
 	addPayload := map[string]interface{}{"uris": uris}
 	addBody, _ := json.Marshal(addPayload)
-	addReq, err := http.NewRequest("POST", "https://api.spotify.com/v1/playlists/"+created.ID+"/tracks", strings.NewReader(string(addBody)))
+	addReq, err := http.NewRequest("POST", "https://api.spotify.com/v1/playlists/"+created.ID+"/items", strings.NewReader(string(addBody)))
 	if err != nil {
 		return "", "", err
 	}

@@ -3,8 +3,10 @@ package recommendation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -91,14 +93,16 @@ func (s *Service) Recommend(
 
 	items, err := s.fetchSpotifyRecommendations(ctx, userID, mode, limit, artistSeeds, genreSeeds, nil)
 	if err != nil || len(items) == 0 {
-		warn := "spotify recommendations unavailable"
 		if err != nil {
-			warn = err.Error()
+			if errors.Is(err, ErrSpotifyRecommendationsUnavailable) {
+				log.Printf("spotify recommendations restricted for app (seeds artists=%v genres=%v)", artistSeeds, genreSeeds)
+				return nil, ErrSpotifyRecommendationsUnavailable
+			}
 			log.Printf("spotify recommendations failed (seeds artists=%v genres=%v): %v", artistSeeds, genreSeeds, err)
-		} else {
-			log.Printf("spotify recommendations returned 0 tracks (seeds artists=%v genres=%v)", artistSeeds, genreSeeds)
+			return nil, err
 		}
-		return nil, fmt.Errorf("%s", warn)
+		log.Printf("spotify recommendations returned 0 tracks (seeds artists=%v genres=%v)", artistSeeds, genreSeeds)
+		return nil, ErrSpotifyRecommendationsUnavailable
 	}
 
 	return &Result{
@@ -164,6 +168,9 @@ func (s *Service) fetchSpotifyRecommendations(
 	body, err := s.spotify.DoGET(ctx, userID, rawURL)
 	if err != nil {
 		if apiErr, ok := err.(domain.APIError); ok {
+			if apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusForbidden {
+				return nil, ErrSpotifyRecommendationsUnavailable
+			}
 			return nil, fmt.Errorf("spotify recommendations %d: %s", apiErr.StatusCode, apiErr.Message)
 		}
 		return nil, err

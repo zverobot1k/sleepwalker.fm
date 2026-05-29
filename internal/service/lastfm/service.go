@@ -124,12 +124,10 @@ func (s *Service) AggregateArtistGenres(ctx context.Context, artistNames []strin
 	wg.Wait()
 
 	if len(counts) == 0 {
-		warn := "no last.fm tags found"
 		if len(fetchErrors) > 0 {
 			log.Printf("lastfm genre aggregation failures: %s", strings.Join(fetchErrors, "; "))
-			warn = warn + ": " + fetchErrors[0]
 		}
-		return []GenreStat{{Genre: "unknown", Count: 0, Weight: 0}}, warn
+		return []GenreStat{{Genre: "unknown", Count: 0, Weight: 0}}, "no last.fm tags found"
 	}
 
 	total := 0

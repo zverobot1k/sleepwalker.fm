@@ -19,12 +19,19 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatal(err)
+	}
 	if cfg.SpotifyClientID == "" {
 		log.Fatal("SPOTIFY_CLIENT_ID is required")
 	}
 	if cfg.DatabaseURL == "" {
 		log.Fatal("DATABASE_URL is required")
+	}
+	log.Printf("config: BASE_URL=%s (api) FRONTEND_URL=%s (ui) SPOTIFY_REDIRECT_URI=%s (spotify→backend)", cfg.BaseURL, cfg.FrontendURL, cfg.SpotifyRedirectURI)
+	if cfg.BaseURL == cfg.FrontendURL {
+		log.Print("warning: BASE_URL and FRONTEND_URL are identical; post-login redirect may hit the API host instead of the Next.js app")
 	}
 
 	ctx := context.Background()
@@ -74,11 +81,21 @@ func main() {
 		lastfmSvc,
 	)
 
+	corsOrigins := []string{
+		cfg.FrontendURL,
+		"http://localhost:3000",
+		"http://127.0.0.1:3000",
+	}
+	if cfg.BaseURL != cfg.FrontendURL {
+		corsOrigins = append(corsOrigins, cfg.BaseURL)
+	}
+	log.Printf("config: CORS allowed origins: %v", corsOrigins)
+
 	router := transport.NewRouter(transport.RouterDeps{
 		OAuth:      oauthHandler,
 		Health:     healthHandler,
 		SpotifyAPI: spotifyAPIHandler,
-	})
+	}, corsOrigins)
 
 	log.Printf("listening on %s", cfg.ServerAddr)
 	if err := router.Run(cfg.ServerAddr); err != nil {

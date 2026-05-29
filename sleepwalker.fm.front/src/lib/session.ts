@@ -26,3 +26,19 @@ export function clearSession() {
   if (typeof window === 'undefined') return;
   localStorage.removeItem(KEY);
 }
+
+/** Apply one-time OAuth query params from backend redirect, then strip them from the URL. */
+export function consumeOAuthSearchParams(): boolean {
+  if (typeof window === 'undefined') return false;
+  const params = new URLSearchParams(window.location.search);
+  const userId = params.get('user_id');
+  if (!userId) return false;
+
+  setSession({
+    userId,
+    displayName: params.get('display_name') || undefined,
+    email: params.get('email') || undefined,
+  });
+  window.history.replaceState({}, '', window.location.pathname);
+  return true;
+}

@@ -32,8 +32,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <Moon className="w-5 h-5 text-white" />
             </div>
             <div>
-              <p className="text-lg font-semibold">sleepwalker.fm</p>
-              <p className="text-xs text-muted-foreground">Spotify Analytics</p>
+              <p className="text-lg font-semibold">{t('appName')}</p>
+              <p className="text-xs text-muted-foreground">{t('appTagline')}</p>
             </div>
           </div>
 
@@ -64,7 +64,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               className="w-full px-4 py-2 rounded-lg bg-secondary/60 hover:bg-secondary transition flex items-center justify-center gap-2"
             >
               <Globe className="w-4 h-4" />
-              {lang === 'en' ? 'Русский' : 'English'}
+              {t('languageSwitch')}
             </button>
             <div className="text-xs text-muted-foreground px-2 truncate">
               {session?.displayName || session?.email || session?.userId}

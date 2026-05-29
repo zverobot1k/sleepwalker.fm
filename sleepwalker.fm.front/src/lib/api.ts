@@ -1,10 +1,6 @@
-const API_BASE = (
-  process.env.NEXT_PUBLIC_API_URL ||
-  process.env.NEXT_PUBLIC_API_BASE_URL ||
-  'http://localhost:8080'
-).replace(/\/+$/, '');
+import { apiRequestHeaders, describeFetchError, getApiBase } from '@/lib/api-base';
 
-export type ApiWarning = { warning?: string; source?: string };
+export type ApiWarning = { warning?: string; notice?: string; source?: string };
 
 export type ExternalURLs = Record<string, string>;
 
@@ -90,6 +86,8 @@ export type AudioFeature = {
 export type AudioFeaturesResponse = {
   audio_features: AudioFeature[];
   warning?: string;
+  notice?: string;
+  source?: string;
 };
 
 export type WrappedSummaryResponse = {
@@ -101,6 +99,7 @@ export type WrappedSummaryResponse = {
   recent_minutes_total?: number;
   unique_tracks_recent?: number;
   unique_artists_recent?: number;
+  notice?: string;
   warning?: string;
   audio_features_warning?: string;
 };
@@ -112,6 +111,7 @@ export type WrappedInsightsResponse = {
   top_artist?: string;
   top_track?: string;
   listener_tag?: string;
+  notice?: string;
   warning?: string;
 };
 
@@ -132,6 +132,7 @@ export type WrappedCompareResponse = {
   right_top_track?: string;
   left_top_artist?: string;
   right_top_artist?: string;
+  notice?: string;
   warning?: string;
 };
 
@@ -149,6 +150,7 @@ export type StatsGenresResponse = {
   time_range?: string;
   genres: Array<{ genre: string; count: number; weight?: number }>;
   source?: string;
+  notice?: string;
   warning?: string;
 };
 
@@ -166,8 +168,17 @@ export type RecommendationsResponse = {
   source: string;
   items: Array<{ track: Track; reason: string }>;
   warning?: string;
+  notice?: string;
   seed_track_ids?: string[];
   seed_artist_ids?: string[];
+};
+
+export type ExportTrack = {
+  id: string;
+  name: string;
+  artists: string[];
+  uri: string;
+  spotify_url?: string;
 };
 
 export type SessionStateResponse = {
@@ -182,7 +193,9 @@ export type CreatePlaylistResponse = {
   playlist_url?: string;
   tracks_added: number;
   warning?: string;
+  notice?: string;
   fallback_uris?: string[];
+  fallback_tracks?: ExportTrack[];
 };
 
 function buildQuery(params: Record<string, string | number | boolean | undefined | null>) {
@@ -197,16 +210,26 @@ function buildQuery(params: Record<string, string | number | boolean | undefined
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const method = (init?.method || 'GET').toUpperCase();
-  const headers = new Headers(init?.headers || {});
+  const headers = apiRequestHeaders(init?.headers);
   if (method !== 'GET' && method !== 'HEAD' && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers,
-    cache: 'no-store',
-  });
+  const url = `${getApiBase()}${path}`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...init,
+      headers,
+      cache: 'no-store',
+      mode: 'cors',
+    });
+  } catch (err) {
+    const message = describeFetchError(url, err);
+    console.error('[sleepwalker.fm] API request failed:', url, err);
+    throw new Error(message);
+  }
 
   const text = await res.text();
   let body: unknown = null;
@@ -217,10 +240,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       body = null;
     }
   }
+
   if (!res.ok) {
-    const message = (body as { error?: string } | null)?.error || `Request failed: ${res.status}`;
+    const message =
+      (body as { error?: string } | null)?.error ||
+      `Request failed: ${res.status} ${res.statusText} (${url})`;
+    console.error('[sleepwalker.fm] API error response:', res.status, url, body ?? text.slice(0, 200));
     throw new Error(message);
   }
+
   return body as T;
 }
 
