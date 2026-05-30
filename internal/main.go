@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"sleepwalker.fm/internal/config"
 	"sleepwalker.fm/internal/repository/postgres"
 	authservice "sleepwalker.fm/internal/service/auth"
@@ -53,6 +54,18 @@ func main() {
 	tokenRepo := postgres.NewTokenRepo(db)
 	artistMetadataRepo := postgres.NewArtistMetadataRepo(db)
 
+	var redisClient *redis.Client
+	if cfg.RedisURL != "" {
+		redisClient = redis.NewClient(&redis.Options{Addr: cfg.RedisURL})
+		redisCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		if err := redisClient.Ping(redisCtx).Err(); err != nil {
+			log.Printf("warning: redis unavailable: %v", err)
+			_ = redisClient.Close()
+			redisClient = nil
+		}
+		cancel()
+	}
+
 	httpClient := &http.Client{Timeout: 15 * time.Second}
 	oauthService := spotify.NewOAuthService(cfg, httpClient, stateRepo, tokenRepo)
 	if cfg.LastFmAPIKey == "" {
@@ -60,8 +73,8 @@ func main() {
 	}
 	lastfmClient := lastfmservice.NewClient(cfg.LastFmAPIKey, &http.Client{Timeout: 10 * time.Second})
 
-	tokenSvc := tokenservice.NewService(tokenRepo, oauthService)
-	spotifyAPI := spotify.NewAPIService(cfg, httpClient, tokenSvc)
+	tokenSvc := tokenservice.NewService(tokenRepo, oauthService, redisClient)
+	spotifyAPI := spotify.NewAPIService(cfg, httpClient, tokenSvc, redisClient)
 	lastfmSvc := lastfmservice.NewService(lastfmClient)
 	pipe := pipeline.New(spotifyAPI, lastfmSvc)
 	recSvc := recommendationservice.NewService(spotifyAPI, lastfmSvc)
@@ -79,7 +92,11 @@ func main() {
 		pipe,
 		recSvc,
 		lastfmSvc,
+		redisClient,
 	)
+	if redisClient != nil {
+		defer redisClient.Close()
+	}
 
 	corsOrigins := []string{
 		cfg.FrontendURL,

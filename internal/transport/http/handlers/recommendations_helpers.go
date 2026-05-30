@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -87,12 +88,15 @@ func (c *artistCache) get(id string) (ArtistItem, bool) {
 	defer c.mu.Unlock()
 	entry, ok := c.items[id]
 	if !ok {
+		log.Printf("DIAG cache artistCache MISS id=%s", id)
 		return ArtistItem{}, false
 	}
 	if time.Now().After(entry.expiresAt) {
 		delete(c.items, id)
+		log.Printf("DIAG cache artistCache EXPIRED id=%s", id)
 		return ArtistItem{}, false
 	}
+	log.Printf("DIAG cache artistCache HIT id=%s", id)
 	return entry.artist, true
 }
 
@@ -100,6 +104,7 @@ func (c *artistCache) set(id string, artist ArtistItem) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.items[id] = artistCacheEntry{artist: artist, expiresAt: time.Now().Add(c.ttl)}
+	log.Printf("DIAG cache artistCache SET id=%s expires_in=%s", id, c.ttl)
 }
 
 func newRelatedArtistsCache(ttl time.Duration) *relatedArtistsCache {
@@ -111,12 +116,15 @@ func (c *relatedArtistsCache) get(id string) ([]ArtistItem, bool) {
 	defer c.mu.Unlock()
 	entry, ok := c.items[id]
 	if !ok {
+		log.Printf("DIAG cache relatedArtistsCache MISS id=%s", id)
 		return nil, false
 	}
 	if time.Now().After(entry.expiresAt) {
 		delete(c.items, id)
+		log.Printf("DIAG cache relatedArtistsCache EXPIRED id=%s", id)
 		return nil, false
 	}
+	log.Printf("DIAG cache relatedArtistsCache HIT id=%s count=%d", id, len(entry.artists))
 	return entry.artists, true
 }
 
@@ -124,6 +132,7 @@ func (c *relatedArtistsCache) set(id string, artists []ArtistItem) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.items[id] = relatedArtistsCacheEntry{artists: artists, expiresAt: time.Now().Add(c.ttl)}
+	log.Printf("DIAG cache relatedArtistsCache SET id=%s count=%d expires_in=%s", id, len(artists), c.ttl)
 }
 
 func newArtistMetadataCache(ttl time.Duration) *artistMetadataCache {
@@ -135,12 +144,15 @@ func (c *artistMetadataCache) get(id string) (artistMetadataEntry, bool) {
 	defer c.mu.Unlock()
 	entry, ok := c.items[id]
 	if !ok {
+		log.Printf("DIAG cache artistMetadataCache MISS id=%s", id)
 		return artistMetadataEntry{}, false
 	}
 	if time.Now().After(entry.expiresAt) {
 		delete(c.items, id)
+		log.Printf("DIAG cache artistMetadataCache EXPIRED id=%s", id)
 		return artistMetadataEntry{}, false
 	}
+	log.Printf("DIAG cache artistMetadataCache HIT id=%s source=%s", id, entry.source)
 	return entry, true
 }
 
@@ -149,6 +161,7 @@ func (c *artistMetadataCache) set(entry artistMetadataEntry) {
 	defer c.mu.Unlock()
 	entry.expiresAt = time.Now().Add(c.ttl)
 	c.items[entry.artistID] = entry
+	log.Printf("DIAG cache artistMetadataCache SET id=%s source=%s expires_in=%s", entry.artistID, entry.source, c.ttl)
 }
 
 func computeAffinityScores(inputs affinityInputs) map[string]float64 {
@@ -471,8 +484,8 @@ func inferGenresFromTagCounts(tags []string, topN int) []string {
 	}
 	counts := map[string]int{}
 	for _, tag := range tags {
-		normalized := strings.TrimSpace(strings.ToLower(tag))
-		if normalized == "" {
+		normalized := normalizeGenreValue(tag)
+		if normalized == "" || isClearlyInvalidGenre(normalized) {
 			continue
 		}
 		counts[normalized]++
@@ -581,16 +594,16 @@ func (h *SpotifyAPIHandler) getArtistMetadataCached(ctx context.Context, artistI
 
 func (h *SpotifyAPIHandler) refreshArtistMetadata(ctx context.Context, artistID string, artistName string, accessToken string) (artistMetadataEntry, error) {
 	entry := artistMetadataEntry{artistID: artistID, source: "cache_miss", updatedAt: time.Now()}
-	artist, err := h.fetchArtistByID(nil, accessToken, artistID)
+	artist, err := h.fetchArtistByID(nil, "", accessToken, artistID)
 	if err != nil {
 		return entry, err
 	}
-	entry.genres = safeStrings(artist.Genres)
+	entry.genres = normalizeGenres(artist.Genres)
 	entry.source = "spotify_single_artist"
 	if len(entry.genres) == 0 && h.lastfmClient != nil && h.lastfmClient.Enabled() {
 		lastfmGenres, lastfmErr := h.lastfmClient.GetArtistTopTags(ctx, chooseArtistName(artistName, artist.Name), 10)
 		if lastfmErr == nil {
-			entry.genres = safeStrings(lastfmGenres)
+			entry.genres = normalizeGenres(lastfmGenres)
 			entry.source = "lastfm_top_tags"
 		} else {
 			entry.source = "spotify_single_artist"
@@ -604,15 +617,29 @@ func (h *SpotifyAPIHandler) refreshArtistMetadata(ctx context.Context, artistID 
 				similarNames = append(similarNames, item.Name)
 			}
 			entry.relatedArtists = safeStrings(similarNames)
-			entry.inferredGenres = inferGenresFromTagCounts(similarNames, 5)
+			tags := make([]string, 0, len(similar)*3)
+			for _, item := range similar {
+				name := strings.TrimSpace(item.Name)
+				if name == "" {
+					continue
+				}
+				artistTags, tagErr := h.lastfmClient.GetArtistTopTags(ctx, name, 3)
+				if tagErr != nil {
+					continue
+				}
+				tags = append(tags, artistTags...)
+			}
+			entry.inferredGenres = inferGenresFromTagCounts(tags, 5)
 			if len(entry.inferredGenres) > 0 {
 				entry.source = "lastfm_similar_artists"
 			}
 		}
 	}
 	if len(entry.inferredGenres) == 0 && len(entry.relatedArtists) > 0 {
-		entry.inferredGenres = inferGenresFromTagCounts(entry.relatedArtists, 5)
+		entry.inferredGenres = []string{}
 	}
+	entry.genres = normalizeGenres(entry.genres)
+	entry.inferredGenres = normalizeGenres(entry.inferredGenres)
 	if h.artistMetadataRepo != nil {
 		_ = h.artistMetadataRepo.Upsert(ctx, postgres.ArtistMetadataRecord{
 			ArtistID:       entry.artistID,
@@ -673,7 +700,7 @@ func (h *SpotifyAPIHandler) getArtistDetailsCached(accessToken string, artistIDs
 
 	var fetchErr error
 	for _, id := range missing {
-		artist, err := h.fetchArtistByID(nil, accessToken, id)
+		artist, err := h.fetchArtistByID(nil, "", accessToken, id)
 		if err != nil {
 			if fetchErr == nil {
 				fetchErr = err
@@ -693,7 +720,7 @@ func (h *SpotifyAPIHandler) getArtistDetailsCached(accessToken string, artistIDs
 	return result, fetchErr
 }
 
-func (h *SpotifyAPIHandler) getRelatedArtistsCached(accessToken string, artistID string) ([]ArtistItem, error) {
+func (h *SpotifyAPIHandler) getRelatedArtistsCached(userID, accessToken string, artistID string) ([]ArtistItem, error) {
 	if artistID == "" {
 		return []ArtistItem{}, nil
 	}
@@ -703,7 +730,7 @@ func (h *SpotifyAPIHandler) getRelatedArtistsCached(accessToken string, artistID
 		}
 	}
 
-	artists, err := h.fetchRelatedArtistsFromSpotify(accessToken, artistID)
+	artists, err := h.fetchRelatedArtistsFromSpotify(context.Background(), userID, accessToken, artistID)
 	if err != nil {
 		return nil, err
 	}
@@ -713,8 +740,8 @@ func (h *SpotifyAPIHandler) getRelatedArtistsCached(accessToken string, artistID
 	return artists, nil
 }
 
-func (h *SpotifyAPIHandler) fetchRelatedArtistsFromSpotify(accessToken string, artistID string) ([]ArtistItem, error) {
-	body, err := h.doSpotifyGETWithAppFallback(accessToken, "https://api.spotify.com/v1/artists/"+artistID+"/related-artists")
+func (h *SpotifyAPIHandler) fetchRelatedArtistsFromSpotify(ctx context.Context, userID, accessToken string, artistID string) ([]ArtistItem, error) {
+	body, err := h.doSpotifyGETWithAppFallback(ctx, userID, accessToken, "https://api.spotify.com/v1/artists/"+artistID+"/related-artists")
 	if err != nil {
 		return nil, err
 	}
@@ -738,7 +765,7 @@ func (h *SpotifyAPIHandler) fetchRelatedArtistsFromSpotify(accessToken string, a
 	return payload.Artists, nil
 }
 
-func (h *SpotifyAPIHandler) expandSeedArtistsWithRelated(accessToken string, seedArtists []string, ranked []string, max int) ([]string, []string) {
+func (h *SpotifyAPIHandler) expandSeedArtistsWithRelated(userID, accessToken string, seedArtists []string, ranked []string, max int) ([]string, []string) {
 	warnings := []string{}
 	if len(seedArtists) >= max {
 		return seedArtists, warnings
@@ -749,7 +776,7 @@ func (h *SpotifyAPIHandler) expandSeedArtistsWithRelated(accessToken string, see
 		if len(seedArtists) >= max {
 			break
 		}
-		related, err := h.getRelatedArtistsCached(accessToken, candidateID)
+		related, err := h.getRelatedArtistsCached(userID, accessToken, candidateID)
 		if err != nil {
 			warnings = append(warnings, "related artists unavailable")
 			continue
@@ -833,7 +860,7 @@ func (h *SpotifyAPIHandler) buildAudioProfileFromInputs(accessToken string, inpu
 		return audioProfile{}, "audio features unavailable"
 	}
 
-	features, err := h.fetchAudioFeaturesFromSpotify(accessToken, trackIDs)
+	features, err := h.fetchAudioFeaturesFromSpotify(context.Background(), "", accessToken, trackIDs)
 	if err != nil {
 		if isSpotifyForbidden(err) {
 			return audioProfile{}, "audio features unavailable: spotify returned 403"

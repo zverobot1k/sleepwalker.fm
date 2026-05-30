@@ -32,6 +32,7 @@ type SpotifyTokens struct {
 type APIError struct {
 	StatusCode int
 	Message    string
+	RetryAfter string
 }
 
 func (e APIError) Error() string {

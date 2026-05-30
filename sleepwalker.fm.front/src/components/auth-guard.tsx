@@ -2,17 +2,17 @@
 
 import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import { getSession } from '@/lib/session';
+import { useSession } from '@/hooks/use-session';
 
 export function AuthGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter();
+  const session = useSession();
 
   useEffect(() => {
-    const session = getSession();
     if (!session?.userId) {
       router.replace('/');
     }
-  }, [router]);
+  }, [router, session?.userId]);
 
   return <>{children}</>;
 }

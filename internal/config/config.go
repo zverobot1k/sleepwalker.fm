@@ -11,6 +11,7 @@ type Config struct {
 	FrontendURL         string
 	ServerAddr          string
 	DatabaseURL         string
+	RedisURL            string
 	SpotifyClientID     string
 	SpotifyClientSecret string
 	SpotifyRedirectURI  string
@@ -51,6 +52,7 @@ func Load() (Config, error) {
 		FrontendURL:         strings.TrimRight(frontendURL, "/"),
 		ServerAddr:          serverAddr,
 		DatabaseURL:         os.Getenv("DATABASE_URL"),
+		RedisURL:            strings.TrimSpace(os.Getenv("REDIS_URL")),
 		SpotifyClientID:     os.Getenv("SPOTIFY_CLIENT_ID"),
 		SpotifyClientSecret: os.Getenv("SPOTIFY_CLIENT_SECRET"),
 		SpotifyRedirectURI:  redirectURI,

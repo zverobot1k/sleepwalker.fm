@@ -1,12 +1,12 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api } from '@/lib/api';
 import { useSession } from '@/hooks/use-session';
 import { EmptyState, ErrorState, LoadingState } from '@/components/ui-state';
 import { useI18n } from '@/components/providers/i18n-provider';
 import { InfoBanner } from '@/components/info-banner';
-import { resolveNotice } from '@/lib/notices';
+import { formatGenreDisplay, resolveNotice } from '@/lib/notices';
 
 export default function WrappedPage() {
   const session = useSession();
@@ -42,7 +42,7 @@ export default function WrappedPage() {
           const first = results.find((r) => r.status === 'rejected');
           const message = first?.status === 'rejected' && first.reason instanceof Error
             ? first.reason.message
-            : t('failedWrapped');
+            : 'Failed to load wrapped';
           setError(message);
         } else if (anyFailure) {
           setPartialNotice(true);
@@ -57,7 +57,7 @@ export default function WrappedPage() {
         setCompare(valueOrNull(results[3]));
       } catch (e) {
         if (!mounted) return;
-        setError(e instanceof Error ? e.message : t('failedWrapped'));
+        setError(e instanceof Error ? e.message : 'Failed to load wrapped');
       } finally {
         if (mounted) setLoading(false);
       }
@@ -66,7 +66,15 @@ export default function WrappedPage() {
     return () => {
       mounted = false;
     };
-  }, [session?.userId, t]);
+  }, [session?.userId]);
+
+  const displayedGenres = useMemo(
+    () =>
+      (summary?.top_genres || [])
+        .map((entry) => ({ ...entry, genre: formatGenreDisplay(lang, entry.genre) }))
+        .filter((entry) => entry.genre),
+    [summary?.top_genres, lang],
+  );
 
   const notices = [
     partialNotice ? t('partialLoad') : null,
@@ -107,7 +115,7 @@ export default function WrappedPage() {
         <div className="p-5 rounded-2xl border border-glass-border bg-glass-bg">
           <h2 className="text-lg font-semibold mb-3">{t('topGenres')}</h2>
           <ul className="space-y-2 text-sm">
-            {(summary?.top_genres || []).slice(0, 10).map((g, index) => (
+            {displayedGenres.slice(0, 10).map((g, index) => (
               <li key={g.genre} className="flex items-center justify-between gap-3">
                 <span className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-glass-border bg-secondary/30 text-xs font-semibold text-foreground">
                   {index + 1}

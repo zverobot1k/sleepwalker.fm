@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -106,17 +108,38 @@ func (h *SpotifyAPIHandler) getAppAccessToken() (string, error) {
 	return payload.AccessToken, nil
 }
 
-func (h *SpotifyAPIHandler) doSpotifyGETWithAppFallback(accessToken string, url string) ([]byte, error) {
+func (h *SpotifyAPIHandler) doSpotifyGETWithAppFallback(ctx context.Context, userID, accessToken string, url string) ([]byte, error) {
+	if h.spotifyAPI != nil {
+		body, err := h.spotifyAPI.DoGETWithToken(ctx, userID, accessToken, url)
+		if err == nil {
+			return body, nil
+		}
+		log.Printf("DIAG spotify app-fallback via APIService failed url=%s err=%v", url, err)
+		if !isSpotifyForbidden(err) && !isSpotifyRateLimited(err) {
+			return nil, err
+		}
+	}
 	body, err := h.doSpotifyGET(accessToken, url)
 	if err == nil {
 		return body, nil
 	}
+	log.Printf("DIAG spotify app-fallback: initial request failed url=%s err=%v", url, err)
 	if !isSpotifyForbidden(err) && !isSpotifyRateLimited(err) {
 		return nil, err
 	}
 	appToken, appErr := h.getAppAccessToken()
 	if appErr != nil {
+		log.Printf("DIAG spotify app-fallback: getAppAccessToken failed: %v", appErr)
 		return nil, err
 	}
-	return h.doSpotifyGET(appToken, url)
+	log.Printf("DIAG spotify app-fallback: using app token for url=%s", url)
+	if h.spotifyAPI != nil {
+		body, appErr = h.spotifyAPI.DoGETWithToken(ctx, userID, appToken, url)
+	} else {
+		body, appErr = h.doSpotifyGET(appToken, url)
+	}
+	if appErr != nil {
+		log.Printf("DIAG spotify app-fallback: app request err=%v", appErr)
+	}
+	return body, appErr
 }

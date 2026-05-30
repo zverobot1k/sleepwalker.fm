@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -81,18 +82,15 @@ func (s *OAuthService) HandleCallback(ctx context.Context, code, state string) (
 		return domain.SpotifyProfile{}, err
 	}
 
-	profile, err := s.fetchProfile(ctx, tokenResp.AccessToken)
-	if err != nil {
-		return domain.SpotifyProfile{}, err
-	}
-
 	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 	if tokenResp.RefreshToken == "" {
 		return domain.SpotifyProfile{}, errors.New("spotify did not return refresh_token")
 	}
 
+	userID := spotifyUserID(tokenResp.RefreshToken)
+
 	if err := s.tokenRepo.UpsertTokens(ctx, domain.SpotifyTokens{
-		UserID:       profile.ID,
+		UserID:       userID,
 		AccessToken:  tokenResp.AccessToken,
 		RefreshToken: tokenResp.RefreshToken,
 		Scope:        tokenResp.Scope,
@@ -102,7 +100,7 @@ func (s *OAuthService) HandleCallback(ctx context.Context, code, state string) (
 		return domain.SpotifyProfile{}, err
 	}
 
-	return profile, nil
+	return domain.SpotifyProfile{ID: userID}, nil
 }
 
 func (s *OAuthService) RefreshAccessToken(ctx context.Context, userID string) (domain.SpotifyTokens, error) {
@@ -214,6 +212,11 @@ func randomString(length int) (string, error) {
 func codeChallenge(verifier string) string {
 	hash := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(hash[:])
+}
+
+func spotifyUserID(refreshToken string) string {
+	hash := sha256.Sum256([]byte(refreshToken))
+	return "spotify_" + hex.EncodeToString(hash[:16])
 }
 
 type tokenResponse struct {

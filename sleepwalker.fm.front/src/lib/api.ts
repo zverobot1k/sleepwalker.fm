@@ -208,6 +208,67 @@ function buildQuery(params: Record<string, string | number | boolean | undefined
   return query ? `?${query}` : '';
 }
 
+type CachedValue = {
+  value: unknown;
+  expiresAt: number;
+};
+
+export class ApiRequestError extends Error {
+  status: number;
+  retryAfter?: string;
+
+  constructor(message: string, status: number, retryAfter?: string) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.status = status;
+    this.retryAfter = retryAfter;
+  }
+}
+
+const responseCache = new Map<string, CachedValue>();
+const inflightRequests = new Map<string, Promise<unknown>>();
+
+const DEFAULT_GET_TTL_MS = 45 * 1000;
+const SESSION_TTL_MS = 15 * 1000;
+
+export function cacheSessionState(userId: string, state: SessionStateResponse) {
+  responseCache.set(`GET /auth/session/${encodeURIComponent(userId)}`, {
+    value: state,
+    expiresAt: Date.now() + SESSION_TTL_MS,
+  });
+}
+
+export function readCachedSessionState(userId: string): SessionStateResponse | null {
+  const cached = responseCache.get(`GET /auth/session/${encodeURIComponent(userId)}`);
+  if (!cached || cached.expiresAt <= Date.now()) {
+    responseCache.delete(`GET /auth/session/${encodeURIComponent(userId)}`);
+    return null;
+  }
+  return (cached?.value as SessionStateResponse | undefined) || null;
+}
+
+function cacheKeyFor(path: string): string {
+  return `GET ${path}`;
+}
+
+function getCachedValue<T>(key: string): T | null {
+  const cached = responseCache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    responseCache.delete(key);
+    return null;
+  }
+  return cached.value as T;
+}
+
+function setCachedValue<T>(key: string, value: T, ttlMs = DEFAULT_GET_TTL_MS) {
+  responseCache.set(key, { value, expiresAt: Date.now() + ttlMs });
+}
+
+function invalidateSessionCache(userId: string) {
+  responseCache.delete(`GET /auth/session/${encodeURIComponent(userId)}`);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const method = (init?.method || 'GET').toUpperCase();
   const headers = apiRequestHeaders(init?.headers);
@@ -216,40 +277,85 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   const url = `${getApiBase()}${path}`;
+  const cacheKey = `${method} ${url}`;
+  const pathCacheKey = cacheKeyFor(path);
 
-  let res: Response;
-  try {
-    res = await fetch(url, {
-      ...init,
-      headers,
-      cache: 'no-store',
-      mode: 'cors',
-    });
-  } catch (err) {
-    const message = describeFetchError(url, err);
-    console.error('[sleepwalker.fm] API request failed:', url, err);
-    throw new Error(message);
-  }
-
-  const text = await res.text();
-  let body: unknown = null;
-  if (text) {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = null;
+  if (method === 'GET') {
+    const page = path.startsWith('/api/wrapped/')
+      ? 'wrapped'
+      : path.startsWith('/api/recommendations/')
+        ? 'recommendations'
+        : path.startsWith('/api/spotify/') || path.startsWith('/api/stats/')
+          ? 'dashboard'
+          : undefined;
+    if (page && !headers.has('X-SWFM-Page')) {
+      headers.set('X-SWFM-Page', page);
     }
   }
 
-  if (!res.ok) {
-    const message =
-      (body as { error?: string } | null)?.error ||
-      `Request failed: ${res.status} ${res.statusText} (${url})`;
-    console.error('[sleepwalker.fm] API error response:', res.status, url, body ?? text.slice(0, 200));
-    throw new Error(message);
+  if (method === 'GET') {
+    const cached = getCachedValue<T>(pathCacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const inflight = inflightRequests.get(pathCacheKey);
+    if (inflight) {
+      return inflight as Promise<T>;
+    }
   }
 
-  return body as T;
+  let res: Response;
+  const fetchPromise = (async () => {
+    try {
+      res = await fetch(url, {
+        ...init,
+        headers,
+        cache: 'no-store',
+        mode: 'cors',
+      });
+    } catch (err) {
+      const message = describeFetchError(url, err);
+      console.error('[sleepwalker.fm] API request failed:', url, err);
+      throw new Error(message);
+    }
+
+    const text = await res.text();
+    let body: unknown = null;
+    if (text) {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = null;
+      }
+    }
+
+    if (!res.ok) {
+      const message =
+        (body as { error?: string } | null)?.error ||
+        (res.status === 429 ? 'Spotify rate limited. Try again later.' : `Request failed: ${res.status} ${res.statusText} (${url})`);
+      console.error('[sleepwalker.fm] API error response:', res.status, url, body ?? text.slice(0, 200));
+      throw new ApiRequestError(message, res.status, res.headers.get('Retry-After') || undefined);
+    }
+
+    if (method === 'GET') {
+      setCachedValue(pathCacheKey, body as T);
+    }
+
+    return body as T;
+  })();
+
+  if (method === 'GET') {
+    inflightRequests.set(pathCacheKey, fetchPromise as Promise<unknown>);
+  }
+
+  try {
+    return await fetchPromise;
+  } finally {
+    if (method === 'GET') {
+      inflightRequests.delete(pathCacheKey);
+    }
+  }
 }
 
 export const api = {
@@ -260,7 +366,10 @@ export const api = {
     request<{ user_id: string; expires_at: string }>(
       `/auth/refresh/${encodeURIComponent(userId)}`,
       { method: 'POST' },
-    ),
+    ).then((result) => {
+      invalidateSessionCache(userId);
+      return result;
+    }),
 
   topArtists: (userId: string, timeRange = 'medium_term', limit = 12) =>
     request<TopArtistsResponse>(

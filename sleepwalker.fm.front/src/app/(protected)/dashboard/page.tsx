@@ -7,7 +7,7 @@ import { useSession } from '@/hooks/use-session';
 import { EmptyState, ErrorState, LoadingState } from '@/components/ui-state';
 import { useI18n } from '@/components/providers/i18n-provider';
 import { InfoBanner } from '@/components/info-banner';
-import { resolveNotice, resolveReason, resolveSourceLabel } from '@/lib/notices';
+import { formatGenreDisplay, resolveNotice, resolveReason, resolveSourceLabel } from '@/lib/notices';
 
 type DashboardData = {
   artists: Awaited<ReturnType<typeof api.topArtists>> | null;
@@ -41,6 +41,14 @@ export default function DashboardPage() {
     recs: null,
   });
 
+  const timelineData = useMemo(() => {
+    const byDay = data.timeline?.by_day || [];
+    if (byDay.length > 7) {
+      return byDay.slice(-7);
+    }
+    return byDay;
+  }, [data.timeline]);
+
   useEffect(() => {
     if (!session?.userId) return;
     let mounted = true;
@@ -70,7 +78,7 @@ export default function DashboardPage() {
           const first = results.find((r) => r.status === 'rejected');
           const message = first?.status === 'rejected' && first.reason instanceof Error
             ? first.reason.message
-            : t('failedDashboard');
+            : 'Failed to load dashboard';
           setError(message);
         } else if (anyFailure) {
           setPartialNotice(true);
@@ -92,7 +100,7 @@ export default function DashboardPage() {
         });
       } catch (e) {
         if (!mounted) return;
-        setError(e instanceof Error ? e.message : t('failedDashboard'));
+        setError(e instanceof Error ? e.message : 'Failed to load dashboard');
       } finally {
         if (mounted) setLoading(false);
       }
@@ -101,7 +109,23 @@ export default function DashboardPage() {
     return () => {
       mounted = false;
     };
-  }, [session?.userId, t]);
+  }, [session?.userId]);
+
+  const displayedGenres = useMemo(
+    () =>
+      (data.genres?.genres || [])
+        .map((entry) => ({ ...entry, genre: formatGenreDisplay(lang, entry.genre) }))
+        .filter((entry) => entry.genre),
+    [data.genres?.genres, lang],
+  );
+
+  const displayedWrappedGenres = useMemo(
+    () =>
+      (data.wrapped?.top_genres || [])
+        .map((entry) => formatGenreDisplay(lang, entry.genre))
+        .filter(Boolean),
+    [data.wrapped?.top_genres, lang],
+  );
 
   const avgAudio = useMemo(() => {
     const items = data.audio?.audio_features || [];
@@ -157,14 +181,14 @@ export default function DashboardPage() {
 
       <div className="grid lg:grid-cols-2 gap-6">
         <Panel title={t('genreDistribution')}>
-          {!data.genres?.genres?.length ? (
+          {!displayedGenres.length ? (
             <EmptyState text={t('empty')} />
           ) : (
             <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
                 <PieChart>
-                  <Pie data={data.genres.genres.slice(0, 8)} dataKey="count" nameKey="genre" outerRadius={100}>
-                    {data.genres.genres.slice(0, 8).map((_, i) => (
+                  <Pie data={displayedGenres.slice(0, 8)} dataKey="count" nameKey="genre" outerRadius={100}>
+                    {displayedGenres.slice(0, 8).map((_, i) => (
                       <Cell key={i} fill={colors[i % colors.length]} />
                     ))}
                   </Pie>
@@ -176,12 +200,12 @@ export default function DashboardPage() {
         </Panel>
 
         <Panel title={t('listeningTimeline')}>
-          {!data.timeline?.by_day?.length ? (
+          {!timelineData.length ? (
             <EmptyState text={t('empty')} />
           ) : (
             <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={data.timeline.by_day}>
+                <BarChart data={timelineData}>
                   <XAxis dataKey="key" stroke="#c4b5fd" />
                   <YAxis stroke="#c4b5fd" />
                   <Tooltip />
@@ -221,7 +245,7 @@ export default function DashboardPage() {
                 {t('topTracksLabel')}: {(data.wrapped.top_tracks || []).slice(0, 3).map((tr) => tr.name).join(', ') || '—'}
               </p>
               <p>
-                {t('topGenresLastFm')}: {(data.wrapped.top_genres || []).slice(0, 3).map((g) => g.genre).join(', ') || '—'}
+                {t('topGenresLastFm')}: {displayedWrappedGenres.slice(0, 3).join(', ') || '—'}
               </p>
               <p>
                 {t('recentPlays')}: {data.wrapped.recent_plays_count ?? '—'}

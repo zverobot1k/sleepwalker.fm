@@ -62,7 +62,7 @@ func (c *Client) GetArtistTopTags(ctx context.Context, artist string, limit int)
 		TopTags struct {
 			Tag json.RawMessage `json:"tag"`
 		} `json:"toptags"`
-		Error  int    `json:"error"`
+		Error   int    `json:"error"`
 		Message string `json:"message"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -187,15 +187,18 @@ func (c *Client) do(ctx context.Context, values url.Values) ([]byte, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		log.Printf("DIAG lastfm request error: url=%s err=%v", req.URL.String(), err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		log.Printf("DIAG lastfm read body error: url=%s err=%v", req.URL.String(), err)
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("DIAG lastfm non-2xx: url=%s status=%d body=%s", req.URL.String(), resp.StatusCode, strings.TrimSpace(string(body)))
 		return nil, fmt.Errorf("lastfm http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return body, nil

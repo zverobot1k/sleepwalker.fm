@@ -34,11 +34,12 @@ func (h *OAuthHandler) Login(c *gin.Context) {
 // Callback handles Spotify redirect at GET /auth/spotify/callback (see SPOTIFY_REDIRECT_URI).
 func (h *OAuthHandler) Callback(c *gin.Context) {
 	log.Printf("oauth callback: %s %s", c.Request.Method, c.Request.URL.RequestURI())
+	target := h.frontendURL + "/dashboard"
 
 	if errParam := c.Query("error"); errParam != "" {
 		desc := c.Query("error_description")
 		log.Printf("oauth callback: spotify error=%q description=%q", errParam, desc)
-		target := h.frontendURL + "/?oauth_error=" + url.QueryEscape(errParam)
+		target = target + "?oauth_error=" + url.QueryEscape(errParam)
 		log.Printf("oauth callback: redirecting to frontend error page %s", target)
 		c.Redirect(http.StatusFound, target)
 		return
@@ -48,14 +49,16 @@ func (h *OAuthHandler) Callback(c *gin.Context) {
 	state := c.Query("state")
 	if code == "" {
 		log.Printf("oauth callback: missing code")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "missing authorization code"})
+		target = target + "?oauth_error=" + url.QueryEscape("missing authorization code")
+		c.Redirect(http.StatusFound, target)
 		return
 	}
 
 	profile, err := h.auth.HandleCallback(c.Request.Context(), code, state)
 	if err != nil {
 		log.Printf("oauth callback: token exchange failed: %v", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		target = target + "?oauth_error=" + url.QueryEscape("login failed")
+		c.Redirect(http.StatusFound, target)
 		return
 	}
 
@@ -71,7 +74,7 @@ func (h *OAuthHandler) Callback(c *gin.Context) {
 	}
 
 	// Frontend app URL (FRONTEND_URL) — never BASE_URL /auth/callback on the API host.
-	target := h.frontendURL + "/dashboard?" + q.Encode()
+	target = target + "?" + q.Encode()
 	log.Printf("oauth callback: redirecting to frontend dashboard host=%s path=/dashboard", h.frontendURL)
 	c.Redirect(http.StatusFound, target)
 }

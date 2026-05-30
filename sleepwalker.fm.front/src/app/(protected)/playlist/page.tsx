@@ -46,7 +46,12 @@ export default function PlaylistPage() {
       {error && <ErrorState message={error} />}
 
       {result?.playlist_url && (
-        <a href={result.playlist_url} target="_blank" rel="noreferrer" className="inline-block text-violet-300 underline">
+        <a
+          href={result.playlist_url}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center justify-center rounded-xl border border-emerald-500/35 bg-[#121212] px-6 py-3 text-sm font-semibold text-emerald-300 shadow-[0_10px_24px_rgba(16,185,129,0.18)] transition hover:-translate-y-0.5 hover:bg-[#1a1a1a] hover:text-emerald-200 active:translate-y-0 active:bg-[#0f0f0f]"
+        >
           {t('openPlaylist')}
         </a>
       )}

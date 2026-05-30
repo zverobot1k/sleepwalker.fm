@@ -1,4 +1,9 @@
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
   db:
     image: postgres:16
     environment:
@@ -24,6 +29,7 @@ services:
     environment:
       # Only Docker-specific overrides; OAuth URLs must come from .env (no localhost defaults).
       DATABASE_URL: "postgres://postgres:postgres@db:5432/sleepwalker?sslmode=disable"
+      REDIS_URL: "redis:6379"
       SERVER_ADDR: ":8080"
     depends_on:
       db:

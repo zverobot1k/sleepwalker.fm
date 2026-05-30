@@ -26,11 +26,11 @@ export default function RecommendationsPage() {
       const response = await api.recommendations(session.userId, mode, 20);
       setData(response);
     } catch (e) {
-      setError(e instanceof Error ? e.message : t('failedRecommendations'));
+      setError(e instanceof Error ? e.message : 'Failed to load recommendations');
     } finally {
       setLoading(false);
     }
-  }, [session?.userId, mode, t]);
+  }, [session?.userId, mode]);
 
   useEffect(() => {
     load();

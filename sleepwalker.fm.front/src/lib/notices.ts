@@ -77,3 +77,61 @@ export function resolveReason(lang: Language, reason?: string | null): string {
   }
   return reason;
 }
+
+const RU_GENRE_TRANSLATIONS: Record<string, string> = {
+  rap: 'Рэп',
+  'hip hop': 'Хип-хоп',
+  rock: 'Рок',
+  pop: 'Поп',
+  jazz: 'Джаз',
+  electronic: 'Электроника',
+  metal: 'Метал',
+  punk: 'Панк',
+  indie: 'Инди',
+  blues: 'Блюз',
+  soul: 'Соул',
+  folk: 'Фолк',
+  classical: 'Классика',
+  ambient: 'Эмбиент',
+  techno: 'Техно',
+  house: 'Хаус',
+  trance: 'Транс',
+  rnb: 'РнБ',
+  trap: 'Трэп',
+};
+
+function titleCaseWords(value: string): string {
+  return value
+    .split(' ')
+    .map((part) => (part ? part[0].toUpperCase() + part.slice(1) : part))
+    .join(' ');
+}
+
+function localizeGenreLabel(lang: Language, genre: string): string {
+  const normalized = genre.trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
+  if (!normalized) return '';
+  if (lang === 'ru') {
+    const translated = RU_GENRE_TRANSLATIONS[normalized];
+    if (translated) return translated;
+  }
+  return titleCaseWords(normalized);
+}
+
+export function formatGenreDisplay(lang: Language, rawGenre?: string | null): string {
+  if (!rawGenre) return '';
+  const value = rawGenre.trim();
+  if (!value) return '';
+  if (value === 'null' || value === 'undefined') return '';
+
+  const mergedPattern = /^(.*?)\s*(?:via\s+)?based on Last\.fm similar artist:\s*(.+)$/i;
+  const match = value.match(mergedPattern);
+
+  if (match) {
+    const primary = localizeGenreLabel(lang, match[1] || '') || localizeGenreLabel(lang, value);
+    const artist = (match[2] || '').trim();
+    if (!artist) return primary;
+    return `${primary} (Last.fm: ${artist})`;
+  }
+
+  return localizeGenreLabel(lang, value);
+}

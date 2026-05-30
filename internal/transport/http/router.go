@@ -13,6 +13,7 @@ type RouterDeps struct {
 
 func NewRouter(deps RouterDeps, allowedOrigins []string) *gin.Engine {
 	r := gin.New()
+	r.Use(SpotifyAuditMiddleware())
 	r.Use(gin.Logger(), gin.Recovery())
 	r.Use(CORSMiddleware(allowedOrigins))
 
