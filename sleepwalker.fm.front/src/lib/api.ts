@@ -90,6 +90,24 @@ export type AudioFeaturesResponse = {
   source?: string;
 };
 
+export type SpotifySnapshot = {
+  user_id: string;
+  time_range: string;
+  top_tracks: Track[];
+  top_artists: Artist[];
+  recently_played: PlayHistoryItem[];
+  audio_features?: AudioFeature[];
+  created_at: string;
+};
+
+export type SnapshotResponse = {
+  snapshot: SpotifySnapshot;
+  top_genres: Array<{ genre: string; count: number; weight?: number }>;
+  source: string;
+  notice?: string;
+  warning?: string;
+};
+
 export type WrappedSummaryResponse = {
   time_range?: string;
   top_artists: Artist[];
@@ -386,6 +404,11 @@ export const api = {
       `/api/spotify/recently-played/${encodeURIComponent(userId)}${buildQuery({ limit })}`,
     ),
 
+  snapshot: (userId: string, timeRange = 'medium_term') =>
+    request<SnapshotResponse>(
+      `/api/spotify/snapshot/${encodeURIComponent(userId)}${buildQuery({ time_range: timeRange })}`,
+    ),
+
   audioFeatures: (userId: string, timeRange = 'medium_term', limit = 20) =>
     request<AudioFeaturesResponse>(
       `/api/spotify/audio-features/${encodeURIComponent(userId)}${buildQuery({ time_range: timeRange, limit })}`,
@@ -426,7 +449,7 @@ export const api = {
       `/api/stats/listening-time/${encodeURIComponent(userId)}${buildQuery({ from: params?.from, to: params?.to })}`,
     ),
 
-  recommendations: (userId: string, mode = 'comfort', limit = 12) =>
+  recommendations: (userId: string, mode = 'comfort', limit = 20) =>
     request<RecommendationsResponse>(
       `/api/recommendations/${encodeURIComponent(userId)}${buildQuery({ mode, limit })}`,
     ),

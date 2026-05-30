@@ -76,8 +76,8 @@ func main() {
 	tokenSvc := tokenservice.NewService(tokenRepo, oauthService, redisClient)
 	spotifyAPI := spotify.NewAPIService(cfg, httpClient, tokenSvc, redisClient)
 	lastfmSvc := lastfmservice.NewService(lastfmClient)
-	pipe := pipeline.New(spotifyAPI, lastfmSvc)
-	recSvc := recommendationservice.NewService(spotifyAPI, lastfmSvc)
+	pipe := pipeline.New(spotifyAPI, lastfmSvc, redisClient)
+	recSvc := recommendationservice.NewService(lastfmClient)
 	authSvc := authservice.New(oauthService, tokenSvc)
 
 	oauthHandler := handlers.NewOAuthHandler(authSvc, cfg.FrontendURL)

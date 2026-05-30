@@ -4,27 +4,55 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"strconv"
+	"strings"
+	"time"
 
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 	analyticsservice "sleepwalker.fm/internal/service/analytics"
 	lastfmservice "sleepwalker.fm/internal/service/lastfm"
 	spotifyapi "sleepwalker.fm/internal/service/spotify"
 )
 
-// UserSnapshot is Spotify listening data used for analytics.
-type UserSnapshot struct {
-	TopTracks       []Track
-	RecentlyPlayed  []PlayHistoryItem
-	SpotifyArtists  []Artist // raw spotify top artists for metadata merge
+const snapshotCacheTTL = 30 * time.Minute
+
+// SpotifySnapshot is the cached Spotify listening snapshot used by the app.
+type SpotifySnapshot struct {
+	UserID         string            `json:"user_id"`
+	TimeRange      string            `json:"time_range"`
+	TopTracks      []Track           `json:"top_tracks"`
+	TopArtists     []Artist          `json:"top_artists"`
+	RecentlyPlayed []PlayHistoryItem `json:"recently_played"`
+	AudioFeatures  []AudioFeature    `json:"audio_features,omitempty"`
+	CreatedAt      time.Time         `json:"created_at"`
+
+	// Async enrichment fields (optional)
+	TopGenres    []lastfmservice.GenreStat `json:"top_genres,omitempty"`
+	LastFmSource string                    `json:"lastfm_source,omitempty"`
+	SeedGenres   []string                  `json:"seed_genres,omitempty"`
+	SeedArtists  []string                  `json:"seed_artist_ids,omitempty"`
+	SeedTracks   []string                  `json:"seed_track_ids,omitempty"`
+
+	// Deprecated alias kept for older call sites inside the handler layer.
+	SpotifyArtists []Artist `json:"-"`
 }
 
+// Extend snapshot with async enrichment fields (non-blocking)
+// These fields are populated asynchronously and are optional in the fast snapshot.
+type _snapshotEnrichmentFields struct{}
+
+// UserSnapshot is kept for compatibility with existing call sites.
+type UserSnapshot = SpotifySnapshot
+
 type Artist struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Popularity int      `json:"popularity"`
-	Genres     []string `json:"genres"`
-	Images     []Image  `json:"images"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Popularity   int               `json:"popularity"`
+	Genres       []string          `json:"genres"`
+	Images       []Image           `json:"images"`
 	ExternalURLs map[string]string `json:"external_urls"`
 }
 
@@ -45,6 +73,20 @@ type SimpleArtist struct {
 	Name string `json:"name"`
 }
 
+type AudioFeature struct {
+	ID               string  `json:"id"`
+	Danceability     float64 `json:"danceability"`
+	Energy           float64 `json:"energy"`
+	Valence          float64 `json:"valence"`
+	Tempo            float64 `json:"tempo"`
+	Acousticness     float64 `json:"acousticness"`
+	Instrumentalness float64 `json:"instrumentalness"`
+	Liveness         float64 `json:"liveness"`
+	Speechiness      float64 `json:"speechiness"`
+	Loudness         float64 `json:"loudness"`
+	DurationMS       int     `json:"duration_ms"`
+}
+
 type PlayHistoryItem struct {
 	Track    Track  `json:"track"`
 	PlayedAt string `json:"played_at"`
@@ -54,17 +96,53 @@ type PlayHistoryItem struct {
 type Pipeline struct {
 	spotify *spotifyapi.APIService
 	lastfm  *lastfmservice.Service
+	cache   *redis.Client
+	group   singleflight.Group
 }
 
-func New(spotify *spotifyapi.APIService, lastfm *lastfmservice.Service) *Pipeline {
-	return &Pipeline{spotify: spotify, lastfm: lastfm}
+func New(spotify *spotifyapi.APIService, lastfm *lastfmservice.Service, cache *redis.Client) *Pipeline {
+	return &Pipeline{spotify: spotify, lastfm: lastfm, cache: cache}
 }
 
-func (p *Pipeline) FetchSnapshot(ctx context.Context, userID, timeRange string, limit int) (*UserSnapshot, error) {
-	if limit <= 0 {
-		limit = 20
+func (p *Pipeline) FetchSnapshot(ctx context.Context, userID, timeRange string) (*SpotifySnapshot, error) {
+	if timeRange == "" {
+		timeRange = "medium_term"
 	}
-	topTracks, err := p.fetchTopTracks(ctx, userID, timeRange, limit)
+	cacheKey := p.snapshotCacheKey(userID, timeRange)
+	if snapshot, ok := p.readSnapshotCache(ctx, cacheKey); ok {
+		log.Printf("DIAG snapshot cache HIT user=%s time_range=%s", userID, timeRange)
+		return snapshot, nil
+	}
+	log.Printf("DIAG snapshot cache MISS user=%s time_range=%s", userID, timeRange)
+
+	value, err, shared := p.group.Do(cacheKey, func() (any, error) {
+		if snapshot, ok := p.readSnapshotCache(ctx, cacheKey); ok {
+			log.Printf("DIAG snapshot cache REUSED user=%s time_range=%s", userID, timeRange)
+			return snapshot, nil
+		}
+		snapshot, err := p.buildSnapshot(ctx, userID, timeRange)
+		if err != nil {
+			return nil, err
+		}
+		p.writeSnapshotCache(ctx, cacheKey, snapshot)
+		log.Printf("DIAG snapshot cache REBUILT user=%s time_range=%s", userID, timeRange)
+		return snapshot, nil
+	})
+	if shared {
+		log.Printf("DIAG snapshot singleflight shared user=%s time_range=%s", userID, timeRange)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return value.(*SpotifySnapshot), nil
+}
+
+func (p *Pipeline) buildSnapshot(ctx context.Context, userID, timeRange string) (*SpotifySnapshot, error) {
+	topTracks, err := p.fetchTopTracks(ctx, userID, timeRange, 50)
+	if err != nil {
+		return nil, err
+	}
+	artists, err := p.fetchTopArtistsRaw(ctx, userID, timeRange, 50)
 	if err != nil {
 		return nil, err
 	}
@@ -72,15 +150,16 @@ func (p *Pipeline) FetchSnapshot(ctx context.Context, userID, timeRange string, 
 	if err != nil {
 		return nil, err
 	}
-	artists, err := p.fetchTopArtistsRaw(ctx, userID, timeRange, limit)
-	if err != nil {
-		return nil, err
-	}
-	return &UserSnapshot{
+	snapshot := &SpotifySnapshot{
+		UserID:         userID,
+		TimeRange:      timeRange,
 		TopTracks:      topTracks,
+		TopArtists:     artists,
 		RecentlyPlayed: recent,
-		SpotifyArtists: artists,
-	}, nil
+		CreatedAt:      time.Now().UTC(),
+	}
+	snapshot.SpotifyArtists = snapshot.TopArtists
+	return snapshot, nil
 }
 
 func (p *Pipeline) RankedArtists(snapshot *UserSnapshot, limit int) []analyticsservice.RankedArtist {
@@ -102,7 +181,7 @@ func (p *Pipeline) RankedArtists(snapshot *UserSnapshot, limit int) []analyticss
 func (p *Pipeline) GenreStats(ctx context.Context, snapshot *UserSnapshot, topN int) ([]lastfmservice.GenreStat, string) {
 	names := make([]string, 0)
 	seen := map[string]struct{}{}
-	for _, a := range snapshot.SpotifyArtists {
+	for _, a := range snapshot.TopArtists {
 		if a.Name == "" {
 			continue
 		}
@@ -151,6 +230,31 @@ func (p *Pipeline) fetchTopTracks(ctx context.Context, userID, timeRange string,
 		return nil, err
 	}
 	return payload.Items, nil
+}
+
+func (p *Pipeline) fetchAudioFeatures(ctx context.Context, userID string, trackIDs []string) ([]AudioFeature, error) {
+	if len(trackIDs) == 0 {
+		return []AudioFeature{}, nil
+	}
+	rawURL := p.spotify.BaseURL() + "/audio-features?ids=" + url.QueryEscape(strings.Join(trackIDs, ","))
+	body, err := p.spotify.DoGET(ctx, userID, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		AudioFeatures []AudioFeature `json:"audio_features"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	filtered := make([]AudioFeature, 0, len(payload.AudioFeatures))
+	for _, feature := range payload.AudioFeatures {
+		if feature.ID == "" {
+			continue
+		}
+		filtered = append(filtered, feature)
+	}
+	return filtered, nil
 }
 
 func (p *Pipeline) fetchRecentlyPlayed(ctx context.Context, userID string, limit int) ([]PlayHistoryItem, error) {
@@ -247,4 +351,124 @@ type RankedArtistOutput struct {
 
 func FormatPipelineError(step string, err error) error {
 	return fmt.Errorf("%s: %w", step, err)
+}
+
+func (p *Pipeline) snapshotCacheKey(userID, timeRange string) string {
+	return "swfm:snapshot:" + userID + ":" + timeRange
+}
+
+func (p *Pipeline) readSnapshotCache(ctx context.Context, key string) (*SpotifySnapshot, bool) {
+	if p.cache == nil {
+		return nil, false
+	}
+	body, err := p.cache.Get(ctx, key).Bytes()
+	if err != nil {
+		return nil, false
+	}
+	var snapshot SpotifySnapshot
+	if err := json.Unmarshal(body, &snapshot); err != nil {
+		return nil, false
+	}
+	return &snapshot, true
+}
+
+func (p *Pipeline) writeSnapshotCache(ctx context.Context, key string, snapshot *SpotifySnapshot) {
+	if p.cache == nil || snapshot == nil {
+		return
+	}
+	body, err := json.Marshal(snapshot)
+	if err != nil {
+		return
+	}
+	_ = p.cache.Set(ctx, key, body, snapshotCacheTTL).Err()
+}
+
+func collectTrackIDs(tracks []Track, limit int) []string {
+	if limit <= 0 {
+		limit = len(tracks)
+	}
+	ids := make([]string, 0, limit)
+	for _, track := range tracks {
+		if track.ID == "" {
+			continue
+		}
+		ids = append(ids, track.ID)
+		if len(ids) >= limit {
+			break
+		}
+	}
+	return ids
+}
+
+// FetchAudioFeaturesAsync loads audio features without blocking.
+// Called async from handler after snapshot is cached.
+func (p *Pipeline) FetchAudioFeaturesAsync(ctx context.Context, userID string, snapshot *SpotifySnapshot) {
+	if snapshot == nil || len(snapshot.TopTracks) == 0 {
+		return
+	}
+	go func() {
+		trackIDs := collectTrackIDs(snapshot.TopTracks, 20)
+		if len(trackIDs) == 0 {
+			return
+		}
+		features, err := p.fetchAudioFeatures(ctx, userID, trackIDs)
+		if err != nil {
+			log.Printf("DIAG async audio features failed user=%s err=%v", userID, err)
+			return
+		}
+		snapshot.AudioFeatures = features
+		log.Printf("DIAG async audio features loaded user=%s count=%d", userID, len(features))
+	}()
+}
+
+// PopulateGenreStatsAsync loads top genres from Last.fm async.
+func (p *Pipeline) PopulateGenreStatsAsync(ctx context.Context, snapshot *SpotifySnapshot) {
+	if snapshot == nil {
+		return
+	}
+	go func() {
+		stats, warning := p.GenreStats(ctx, snapshot, 10)
+		snapshot.TopGenres = stats
+		if warning != "" {
+			snapshot.LastFmSource = "fallback"
+		} else {
+			snapshot.LastFmSource = "lastfm"
+		}
+		log.Printf("DIAG async genre stats loaded genres=%d source=%s", len(stats), snapshot.LastFmSource)
+	}()
+}
+
+// PopulateRecommendationSeedsAsync prepares seed data for recommendations async.
+func (p *Pipeline) PopulateRecommendationSeedsAsync(ctx context.Context, snapshot *SpotifySnapshot) {
+	if snapshot == nil {
+		return
+	}
+	go func() {
+		// Genre seeds from Last.fm (with fallback)
+		genreStats, _ := p.GenreStats(ctx, snapshot, 5)
+		seedGenres := SeedGenreNames(genreStats, 5)
+
+		// Fallback: use Spotify genres if Last.fm returns nothing
+		if len(seedGenres) == 0 {
+			seen := map[string]struct{}{}
+			for _, artist := range snapshot.TopArtists {
+				for _, g := range artist.Genres {
+					if g != "" && g != "unknown" {
+						if _, ok := seen[g]; !ok {
+							seedGenres = append(seedGenres, g)
+							seen[g] = struct{}{}
+							if len(seedGenres) >= 5 {
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+
+		snapshot.SeedGenres = seedGenres
+		snapshot.SeedArtists = SeedArtistIDs(p.RankedArtists(snapshot, 5), 5)
+		snapshot.SeedTracks = collectTrackIDs(snapshot.TopTracks, 5)
+		log.Printf("DIAG async recommendation seeds loaded genres=%d artists=%d tracks=%d", len(seedGenres), len(snapshot.SeedArtists), len(snapshot.SeedTracks))
+	}()
 }

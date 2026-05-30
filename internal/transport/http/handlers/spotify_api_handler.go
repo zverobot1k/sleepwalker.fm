@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"runtime/debug"
@@ -115,6 +116,14 @@ type AudioFeatureItem struct {
 	Speechiness      float64 `json:"speechiness"`
 	Loudness         float64 `json:"loudness"`
 	DurationMS       int     `json:"duration_ms"`
+}
+
+type SnapshotResponse struct {
+	Snapshot  pipeline.SpotifySnapshot `json:"snapshot"`
+	TopGenres []GenreCount             `json:"top_genres"`
+	Source    string                   `json:"source"`
+	Notice    string                   `json:"notice,omitempty"`
+	Warning   string                   `json:"warning,omitempty"`
 }
 
 type WrappedSummaryResponse struct {
@@ -325,7 +334,7 @@ func (h *SpotifyAPIHandler) GetTopArtists(c *gin.Context) {
 		return
 	}
 
-	snapshot, err := h.pipeline.FetchSnapshot(ctx, userID, timeRange, maxInt(limit, 50))
+	snapshot, err := h.pipeline.FetchSnapshot(ctx, userID, timeRange)
 	if err != nil {
 		if isSpotifyUnauthorized(err) {
 			h.writeTokenError(c, fmt.Errorf("spotify unauthorized"))
@@ -365,6 +374,13 @@ func (h *SpotifyAPIHandler) GetTopArtists(c *gin.Context) {
 		Limit:  limit,
 		Source: "computed",
 	})
+	return
+}
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func convertPipelineImages(images []pipeline.Image) []Image {
@@ -375,11 +391,84 @@ func convertPipelineImages(images []pipeline.Image) []Image {
 	return out
 }
 
-func maxInt(a, b int) int {
-	if a > b {
-		return a
+// GetSnapshot — единый cached snapshot для dashboard и downstream endpoints.
+func (h *SpotifyAPIHandler) GetSnapshot(c *gin.Context) {
+	userID := c.Param("userId")
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing userId in path"})
+		return
 	}
-	return b
+
+	timeRange := c.DefaultQuery("time_range", defaultTimeRange)
+	if !isValidTimeRange(timeRange) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid time_range: use short_term, medium_term or long_term"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	if body, ok := h.cacheGet(ctx, h.responseCacheKey("snapshot", userID, timeRange)); ok {
+		c.Data(http.StatusOK, "application/json", body)
+		return
+	}
+
+	if h.pipeline == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "snapshot pipeline unavailable"})
+		return
+	}
+
+	snapshot, err := h.pipeline.FetchSnapshot(ctx, userID, timeRange)
+	if err != nil {
+		if h.writeSpotifyError(c, err) {
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// If pipeline snapshot has empty recently_played, try direct Spotify fetch as a fallback.
+	if len(snapshot.RecentlyPlayed) == 0 {
+		accessToken, tokErr := h.getUserAccessToken(ctx, userID)
+		if tokErr == nil {
+			if rp, err := h.fetchRecentlyPlayedFromSpotify(ctx, userID, accessToken, 50, "", ""); err == nil && rp != nil {
+				// convert to pipeline.PlayHistoryItem
+				converted := make([]pipeline.PlayHistoryItem, 0, len(rp.Items))
+				for _, it := range rp.Items {
+					pt := pipeline.Track{
+						ID:         it.Track.ID,
+						Name:       it.Track.Name,
+						URI:        it.Track.URI,
+						DurationMS: it.Track.DurationMS,
+						Artists:    make([]pipeline.SimpleArtist, 0, len(it.Track.Artists)),
+					}
+					for _, a := range it.Track.Artists {
+						pt.Artists = append(pt.Artists, pipeline.SimpleArtist{ID: a.ID, Name: a.Name})
+					}
+					converted = append(converted, pipeline.PlayHistoryItem{Track: pt, PlayedAt: it.PlayedAt})
+				}
+				if len(converted) > 0 {
+					snapshot.RecentlyPlayed = converted
+					// keep pipeline compatibility alias
+					snapshot.SpotifyArtists = snapshot.TopArtists
+					log.Printf("DIAG fallback recently_played loaded user=%s count=%d", userID, len(converted))
+				}
+			}
+		}
+	}
+
+	stats, warning := h.pipeline.GenreStats(ctx, snapshot, 20)
+	resp := SnapshotResponse{
+		Snapshot:  *snapshot,
+		TopGenres: genreStatsToGenreCounts(stats),
+		Source:    "spotify_snapshot",
+	}
+	if warning != "" {
+		resp.Warning = warning
+		if notice := mapGenreWarningToNotice(warning); notice != "" {
+			resp.Notice = notice
+		}
+	}
+
+	h.writeCachedJSON(c, h.responseCacheKey("snapshot", userID, timeRange), 30*time.Minute, resp)
 }
 
 // GetTopTracks — получить топ треков пользователя
@@ -611,7 +700,7 @@ func (h *SpotifyAPIHandler) GetWrappedSummary(c *gin.Context) {
 	var topGenres []GenreCount
 
 	if h.pipeline != nil {
-		snapshot, snapErr := h.pipeline.FetchSnapshot(ctx, userID, timeRange, maxInt(limit, 50))
+		snapshot, snapErr := h.pipeline.FetchSnapshot(ctx, userID, timeRange)
 		if snapErr != nil {
 			if h.writeSpotifyError(c, snapErr) {
 				return
@@ -769,7 +858,7 @@ func (h *SpotifyAPIHandler) GetWrappedInsights(c *gin.Context) {
 	var recentlyPlayed *RecentlyPlayedResponse
 
 	if h.pipeline != nil {
-		snapshot, snapErr := h.pipeline.FetchSnapshot(ctx, userID, timeRange, 20)
+		snapshot, snapErr := h.pipeline.FetchSnapshot(ctx, userID, timeRange)
 		if snapErr != nil {
 			if h.writeSpotifyError(c, snapErr) {
 				return
@@ -1084,7 +1173,7 @@ func (h *SpotifyAPIHandler) GetStatsGenres(c *gin.Context) {
 	warning := ""
 
 	if h.pipeline != nil {
-		snapshot, err := h.pipeline.FetchSnapshot(ctx, userID, timeRange, 50)
+		snapshot, err := h.pipeline.FetchSnapshot(ctx, userID, timeRange)
 		if err != nil {
 			if h.writeSpotifyError(c, err) {
 				return
@@ -1210,6 +1299,12 @@ func (h *SpotifyAPIHandler) GetRecommendations(c *gin.Context) {
 		return
 	}
 
+	timeRange := c.DefaultQuery("time_range", defaultTimeRange)
+	if !isValidTimeRange(timeRange) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid time_range: use short_term, medium_term or long_term"})
+		return
+	}
+
 	mode := c.DefaultQuery("mode", "comfort")
 	if mode != "comfort" && mode != "explore" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid mode: use comfort or explore"})
@@ -1221,91 +1316,42 @@ func (h *SpotifyAPIHandler) GetRecommendations(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	limit = maxInt(limit, 20)
 
 	ctx := c.Request.Context()
-	accessToken, err := h.getUserAccessToken(ctx, userID)
-	if err != nil {
-		h.writeTokenError(c, err)
-		return
-	}
-	if body, ok := h.cacheGet(ctx, h.responseCacheKey("recommendations", userID, mode, strconv.Itoa(limit))); ok {
+	if body, ok := h.cacheGet(ctx, h.responseCacheKey("recommendations", userID, timeRange, mode, strconv.Itoa(limit))); ok {
 		c.Data(http.StatusOK, "application/json", body)
 		return
 	}
 
-	if h.recSvc != nil && h.pipeline != nil {
-		snapshot, snapErr := h.pipeline.FetchSnapshot(ctx, userID, defaultTimeRange, 50)
-		if snapErr != nil {
-			if h.writeSpotifyError(c, snapErr) {
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": snapErr.Error()})
-			return
-		}
-		ranked := h.pipeline.RankedArtists(snapshot, 5)
-		stats, genreWarn := h.pipeline.GenreStats(ctx, snapshot, 3)
-		seedArtists := pipeline.SeedArtistIDs(ranked, 5)
-		seedGenres := pipeline.SeedGenreNames(stats, 3)
-
-		result, recErr := h.recSvc.Recommend(ctx, userID, mode, limit, seedArtists, seedGenres, nil)
-		if recErr == nil && result != nil {
-			h.writeCachedJSON(c, h.responseCacheKey("recommendations", userID, mode, strconv.Itoa(limit)), time.Hour, recommendationResultToHandler(result))
-			return
-		}
-		if recErr != nil {
-			if h.writeSpotifyError(c, recErr) {
-				return
-			}
-			log.Printf("recommendations: spotify path failed: %v", recErr)
-		}
-
-		if recs, ok := h.recommendViaLastFM(ctx, userID, accessToken, snapshot, stats, seedArtists, mode, limit); ok {
-			if recErr != nil {
-				recs.Notice = NoticeRecommendationsListening
-			}
-			_ = genreWarn
-			c.JSON(http.StatusOK, recs)
-			return
-		}
-
-		fallback, fbErr := h.fallbackRecommendations(ctx, userID, accessToken, limit)
-		if fbErr != nil {
-			log.Printf("recommendations: all strategies failed: spotify=%v fallback=%v", recErr, fbErr)
-			h.writeCachedJSON(c, h.responseCacheKey("recommendations_unavailable", userID, mode, strconv.Itoa(limit)), time.Hour, RecommendationsResponse{
-				Mode:   mode,
-				Items:  []RecommendationItem{},
-				Source: "recommendations_unavailable",
-				Notice: NoticeRecommendationsUnavailable,
-			})
-			return
-		}
-		fallback.Notice = NoticeRecommendationsTopTracks
-		h.writeCachedJSON(c, h.responseCacheKey("recommendations", userID, mode, strconv.Itoa(limit)), time.Hour, fallback)
+	if h.pipeline == nil || h.recSvc == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "recommendations pipeline unavailable"})
 		return
 	}
 
-	recs, err := h.fetchRecommendationsFromSpotify(ctx, userID, accessToken, mode, limit)
+	snapshot, err := h.pipeline.FetchSnapshot(ctx, userID, timeRange)
 	if err != nil {
 		if h.writeSpotifyError(c, err) {
 			return
 		}
-		fallback, fbErr := h.fallbackRecommendations(ctx, userID, accessToken, limit)
-		if fbErr != nil {
-			log.Printf("recommendations: fallback failed: spotify=%v fallback=%v", err, fbErr)
-			h.writeCachedJSON(c, h.responseCacheKey("recommendations_unavailable", userID, mode, strconv.Itoa(limit)), time.Hour, RecommendationsResponse{
-				Mode:   mode,
-				Items:  []RecommendationItem{},
-				Source: "recommendations_unavailable",
-				Notice: NoticeRecommendationsUnavailable,
-			})
-			return
-		}
-		fallback.Notice = NoticeRecommendationsTopTracks
-		h.writeCachedJSON(c, h.responseCacheKey("recommendations", userID, mode, strconv.Itoa(limit)), time.Hour, fallback)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	h.writeCachedJSON(c, h.responseCacheKey("recommendations", userID, mode, strconv.Itoa(limit)), time.Hour, recs)
+	recs, err := h.recSvc.RecommendFromSnapshot(ctx, snapshot, mode, limit)
+	if err != nil {
+		log.Printf("recommendations: last.fm engine failed user=%s time_range=%s mode=%s err=%v", userID, timeRange, mode, err)
+		h.writeCachedJSON(c, h.responseCacheKey("recommendations_unavailable", userID, timeRange, mode, strconv.Itoa(limit)), time.Hour, RecommendationsResponse{
+			Mode:   mode,
+			Items:  []RecommendationItem{},
+			Source: "recommendations_unavailable",
+			Notice: NoticeRecommendationsUnavailable,
+		})
+		return
+	}
+
+	response := recommendationResultToHandler(recs)
+	h.writeCachedJSON(c, h.responseCacheKey("recommendations", userID, timeRange, mode, strconv.Itoa(limit)), time.Hour, response)
 }
 
 func recommendationResultToHandler(result *recommendationservice.Result) RecommendationsResponse {
@@ -1404,25 +1450,41 @@ func (h *SpotifyAPIHandler) CreateRecommendationsPlaylist(c *gin.Context) {
 		return
 	}
 
+	timeRange := c.DefaultQuery("time_range", defaultTimeRange)
+	if !isValidTimeRange(timeRange) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid time_range: use short_term, medium_term or long_term"})
+		return
+	}
+
 	accessToken, err := h.getUserAccessToken(c.Request.Context(), userID)
 	if err != nil {
 		h.writeTokenError(c, err)
 		return
 	}
-
-	ctx := c.Request.Context()
-	recs, err := h.fetchRecommendationsFromSpotify(ctx, userID, accessToken, "comfort", limit)
-	if err != nil {
-		fallback, fbErr := h.fallbackRecommendations(ctx, userID, accessToken, limit)
-		if fbErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load tracks for export"})
-			return
-		}
-		c.JSON(http.StatusOK, playlistExportFallbackResponse(fallback.Items, NoticePlaylistExportFallback))
+	if h.pipeline == nil || h.recSvc == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "recommendations pipeline unavailable"})
 		return
 	}
 
-	uris := recommendationURIs(recs.Items)
+	ctx := c.Request.Context()
+	snapshot, err := h.pipeline.FetchSnapshot(ctx, userID, timeRange)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	recs, err := h.recSvc.RecommendFromSnapshot(ctx, snapshot, "comfort", maxInt(limit, 20))
+	if err != nil {
+		c.JSON(http.StatusOK, playlistExportFallbackResponse([]RecommendationItem{}, NoticePlaylistExportFallback))
+		return
+	}
+
+	handlerRecs := recommendationResultToHandler(recs)
+	uris := h.resolveRecommendationURIs(ctx, userID, accessToken, handlerRecs.Items)
+	if len(uris) == 0 {
+		c.JSON(http.StatusOK, playlistExportFallbackResponse(handlerRecs.Items, NoticePlaylistExportFallback))
+		return
+	}
 	playlistID, playlistURL, err := h.createPlaylistWithTracks(accessToken, uris)
 	if err != nil {
 		if isSpotifyForbidden(err) || isSpotifyNotFound(err) {
@@ -1431,7 +1493,7 @@ func (h *SpotifyAPIHandler) CreateRecommendationsPlaylist(c *gin.Context) {
 			if strings.Contains(strings.ToLower(err.Error()), "scope") {
 				notice = NoticePlaylistScopesRestricted
 			}
-			c.JSON(http.StatusOK, playlistExportFallbackResponse(recs.Items, notice))
+			c.JSON(http.StatusOK, playlistExportFallbackResponse(handlerRecs.Items, notice))
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1443,6 +1505,29 @@ func (h *SpotifyAPIHandler) CreateRecommendationsPlaylist(c *gin.Context) {
 		PlaylistURL: playlistURL,
 		TracksAdded: len(uris),
 	})
+}
+
+func (h *SpotifyAPIHandler) resolveRecommendationURIs(ctx context.Context, userID, accessToken string, items []RecommendationItem) []string {
+	uris := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Track.URI != "" {
+			uris = append(uris, item.Track.URI)
+			continue
+		}
+		artistName := ""
+		if len(item.Track.Artists) > 0 {
+			artistName = item.Track.Artists[0].Name
+		}
+		if artistName == "" || item.Track.Name == "" {
+			continue
+		}
+		resolved, err := h.searchSpotifyTrackByArtistAndTitle(ctx, userID, accessToken, artistName, item.Track.Name, 1)
+		if err != nil || len(resolved) == 0 || resolved[0].URI == "" {
+			continue
+		}
+		uris = append(uris, resolved[0].URI)
+	}
+	return uris
 }
 
 func playlistExportFallbackResponse(items []RecommendationItem, notice string) CreatePlaylistResponse {
@@ -1822,62 +1907,465 @@ func (h *SpotifyAPIHandler) recommendViaLastFM(
 	mode string,
 	limit int,
 ) (*RecommendationsResponse, bool) {
-	if h.lastfmClient == nil || !h.lastfmClient.Enabled() {
+	if h.lastfmClient == nil || !h.lastfmClient.Enabled() || h.lastfmSvc == nil {
 		return nil, false
 	}
 
-	baseArtists := make([]ArtistItem, 0, len(snapshot.SpotifyArtists))
+	seedGenres := pipeline.SeedGenreNames(genreStats, 5)
+	if len(seedGenres) == 0 {
+		return nil, false
+	}
+	dominantGenre := seedGenres[0]
+	adjacentGenres := []string{}
+	if len(seedGenres) > 1 {
+		adjacentGenres = append(adjacentGenres, seedGenres[1:]...)
+	}
+
+	baseArtists := make([]ArtistItem, 0, len(snapshot.SpotifyArtists)+len(snapshot.RecentlyPlayed))
+	seenBase := map[string]struct{}{}
 	for _, a := range snapshot.SpotifyArtists {
-		baseArtists = append(baseArtists, ArtistItem{ID: a.ID, Name: a.Name})
+		name := strings.TrimSpace(a.Name)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, ok := seenBase[key]; ok {
+			continue
+		}
+		seenBase[key] = struct{}{}
+		baseArtists = append(baseArtists, ArtistItem{ID: a.ID, Name: name})
+	}
+	for _, item := range snapshot.RecentlyPlayed {
+		for _, a := range item.Track.Artists {
+			name := strings.TrimSpace(a.Name)
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(name)
+			if _, ok := seenBase[key]; ok {
+				continue
+			}
+			seenBase[key] = struct{}{}
+			baseArtists = append(baseArtists, ArtistItem{ID: a.ID, Name: name})
+		}
 	}
 	if len(baseArtists) == 0 {
 		return nil, false
 	}
 
-	similarNames := h.collectLastFmSimilarArtists(ctx, baseArtists, 3, 12)
-	if len(similarNames) == 0 {
-		log.Printf("recommendations: last.fm returned no similar artists for %d base artists", len(baseArtists))
-		return nil, false
+	// Build initial clusters map and aggressively expand candidate pool
+	clusters := map[string][]string{}
+	for _, g := range seedGenres {
+		clusters[g] = []string{}
 	}
 
-	items, recWarnings := h.buildRecommendationsFromSimilarArtists(ctx, userID, accessToken, similarNames, limit)
-	if len(items) == 0 {
-		log.Printf("recommendations: no tracks found for last.fm similar artists")
-		return nil, false
+	// 1) seed from tag.getTopArtists and tag.getTopTracks
+	for _, genre := range seedGenres {
+		// top artists for genre
+		artNames, _ := h.lastfmClient.GetTagTopArtists(ctx, genre, 30)
+		clusters[genre] = appendUniqueStrings(clusters[genre], artNames...)
+		// top tracks for genre (artist, title)
+		tagTracks, _ := h.lastfmClient.GetTagTopTracks(ctx, genre, 40)
+		for _, tt := range tagTracks {
+			clusters[genre] = appendUniqueStrings(clusters[genre], tt.Artist)
+			// store track candidates separately below
+		}
 	}
 
-	topGenre := ""
-	seedGenres := make([]string, 0, 3)
-	for _, g := range genreStats {
-		if g.Genre == "" || g.Genre == "unknown" {
+	// 2) seed from user's top artists and their similar artists + top tracks
+	for _, artist := range baseArtists {
+		clusters[dominantGenre] = appendUniqueStrings(clusters[dominantGenre], artist.Name)
+		similar, _ := h.lastfmClient.GetArtistSimilar(ctx, artist.Name, 12)
+		simNames := make([]string, 0, len(similar))
+		for _, s := range similar {
+			simNames = append(simNames, s.Name)
+		}
+		clusters[dominantGenre] = appendUniqueStrings(clusters[dominantGenre], simNames...)
+		topTracks, _ := h.lastfmClient.GetArtistTopTracks(ctx, artist.Name, 8)
+		for _, tt := range topTracks {
+			clusters[dominantGenre] = appendUniqueStrings(clusters[dominantGenre], tt.Artist)
+		}
+	}
+
+	if len(clusters[dominantGenre]) == 0 {
+		for _, artist := range baseArtists {
+			clusters[dominantGenre] = appendUniqueStrings(clusters[dominantGenre], artist.Name)
+			if len(clusters[dominantGenre]) >= 3 {
+				break
+			}
+		}
+	}
+
+	// expand clusters by fetching similar artists (1-hop)
+	for genre, names := range clusters {
+		if len(names) == 0 {
 			continue
 		}
-		seedGenres = append(seedGenres, g.Genre)
-		if topGenre == "" {
-			topGenre = g.Genre
+		expanded := make([]string, 0, len(names)+32)
+		expanded = append(expanded, names...)
+		for _, name := range names {
+			similar, err := h.lastfmClient.GetArtistSimilar(ctx, name, 6)
+			if err != nil {
+				continue
+			}
+			for _, sim := range similar {
+				simName := strings.TrimSpace(sim.Name)
+				if simName == "" {
+					continue
+				}
+				expanded = appendUniqueStrings(expanded, simName)
+			}
 		}
-		if len(seedGenres) >= 3 {
-			break
-		}
+		clusters[genre] = expanded
 	}
-	for i := range items {
-		reason := items[i].Reason
-		if topGenre != "" {
-			items[i].Reason = fmt.Sprintf("genre %s via %s", topGenre, reason)
+
+	sameQuota, adjacentQuota, exploreQuota := splitRecommendationQuota(limit)
+	items := make([]RecommendationItem, 0, limit)
+	seenTracks := map[string]struct{}{}
+	warnings := []string{}
+
+	appendClusterItems := func(artists []string, quota int, reasonPrefix string) {
+		if quota <= 0 || len(artists) == 0 {
+			return
+		}
+		part, warn := h.buildRecommendationsFromSimilarArtists(ctx, userID, accessToken, artists, quota)
+		if len(warn) > 0 {
+			warnings = append(warnings, warn...)
+		}
+		for _, item := range part {
+			if len(items) >= limit {
+				break
+			}
+			if item.Track.ID == "" {
+				continue
+			}
+			if _, ok := seenTracks[item.Track.ID]; ok {
+				continue
+			}
+			seenTracks[item.Track.ID] = struct{}{}
+			item.Reason = reasonPrefix + ": " + item.Reason
+			items = append(items, item)
 		}
 	}
 
-	if len(recWarnings) > 0 {
-		log.Printf("recommendations: last.fm track lookup: %s", mergeWarnings(recWarnings...))
+	appendClusterItems(clusters[dominantGenre], sameQuota, "same cluster "+dominantGenre)
+
+	adjacentPool := []string{}
+	for _, genre := range adjacentGenres {
+		adjacentPool = appendUniqueStrings(adjacentPool, clusters[genre]...)
 	}
+	appendClusterItems(adjacentPool, adjacentQuota, "adjacent cluster")
+
+	explorationPool := []string{}
+	for _, names := range clusters {
+		explorationPool = appendUniqueStrings(explorationPool, names...)
+	}
+	appendClusterItems(explorationPool, exploreQuota, "graph exploration")
+
+	if len(items) < limit {
+		appendClusterItems(explorationPool, limit-len(items), "graph backfill")
+	}
+
+	if len(items) == 0 {
+		log.Printf("recommendations: no tracks found for last.fm graph clusters")
+		return nil, false
+	}
+
+	// If we have too few items, try aggressive expansion to reach minimum thresholds
+	const minRecommendations = 15
+	seen := map[string]struct{}{}
+	for _, it := range items {
+		if it.Track.ID != "" {
+			seen[it.Track.ID] = struct{}{}
+		}
+	}
+	if len(items) < minRecommendations {
+		need := minRecommendations - len(items)
+		extra, _ := h.expandAndResolveTracks(ctx, userID, accessToken, snapshot, seedGenres, clusters, seen, need)
+		if len(extra) > 0 {
+			items = append(items, extra...)
+		}
+	}
+
+	items = h.filterRecommendationsByAudioProfile(ctx, userID, accessToken, snapshot, items, limit)
+
+	if len(warnings) > 0 {
+		log.Printf("recommendations: last.fm graph warnings: %s", mergeWarnings(warnings...))
+	}
+
+	seedGenres = pipeline.SeedGenreNames(genreStats, 3)
 
 	return &RecommendationsResponse{
 		Mode:          mode,
 		Items:         items,
-		Source:        "lastfm_similar_artists",
+		Source:        "lastfm_taste_graph",
 		SeedArtistIDs: seedArtistIDs,
 		SeedGenres:    seedGenres,
 	}, true
+}
+
+// expandAndResolveTracks aggressively expands candidate tracks from Last.fm
+// using tag.getTopTracks, artist.getTopTracks and track.getSimilar and resolves
+// them to Spotify tracks until we reach at least minNeeded or run out.
+func (h *SpotifyAPIHandler) expandAndResolveTracks(ctx context.Context, userID, accessToken string, snapshot *pipeline.UserSnapshot, seedGenres []string, clusters map[string][]string, seen map[string]struct{}, need int) ([]RecommendationItem, []string) {
+	items := make([]RecommendationItem, 0, need)
+	warnings := []string{}
+	if need <= 0 {
+		return items, warnings
+	}
+
+	// 1) collect track candidates from tag.getTopTracks for seed genres
+	type candidate struct{ Artist, Title string }
+	candMap := map[string]candidate{}
+
+	for _, g := range seedGenres {
+		tracks, err := h.lastfmClient.GetTagTopTracks(ctx, g, 50)
+		if err == nil {
+			for _, tr := range tracks {
+				key := strings.ToLower(strings.TrimSpace(tr.Artist + "|" + tr.Title))
+				if key == "" {
+					continue
+				}
+				candMap[key] = candidate{Artist: tr.Artist, Title: tr.Title}
+			}
+		}
+	}
+
+	// 2) artist top tracks from clusters
+	for _, names := range clusters {
+		for _, name := range names {
+			top, err := h.lastfmClient.GetArtistTopTracks(ctx, name, 8)
+			if err != nil {
+				continue
+			}
+			for _, tr := range top {
+				key := strings.ToLower(strings.TrimSpace(tr.Artist + "|" + tr.Title))
+				if key == "" {
+					continue
+				}
+				candMap[key] = candidate{Artist: tr.Artist, Title: tr.Title}
+			}
+		}
+	}
+
+	// 3) similar tracks from user's top tracks (2-hop)
+	for _, t := range snapshot.TopTracks {
+		for _, a := range t.Artists {
+			sims, err := h.lastfmClient.GetTrackSimilar(ctx, a.Name, t.Name, 12)
+			if err != nil {
+				continue
+			}
+			for _, tr := range sims {
+				key := strings.ToLower(strings.TrimSpace(tr.Artist + "|" + tr.Title))
+				if key == "" {
+					continue
+				}
+				candMap[key] = candidate{Artist: tr.Artist, Title: tr.Title}
+			}
+		}
+	}
+
+	// Resolve candidates to Spotify and append until need satisfied
+	for _, c := range candMap {
+		if len(items) >= need {
+			break
+		}
+		resolved, err := h.searchSpotifyTrackByArtistAndTitle(ctx, userID, accessToken, c.Artist, c.Title, 2)
+		if err != nil || len(resolved) == 0 {
+			continue
+		}
+		for _, tr := range resolved {
+			if len(items) >= need {
+				break
+			}
+			if tr.ID == "" {
+				continue
+			}
+			if _, ok := seen[tr.ID]; ok {
+				continue
+			}
+			seen[tr.ID] = struct{}{}
+			items = append(items, RecommendationItem{Track: tr, Reason: "explore expansion"})
+		}
+	}
+	return items, warnings
+}
+
+func splitRecommendationQuota(limit int) (sameCluster int, adjacent int, exploration int) {
+	if limit <= 0 {
+		return 0, 0, 0
+	}
+	sameCluster = int(math.Round(float64(limit) * 0.7))
+	adjacent = int(math.Round(float64(limit) * 0.2))
+	if sameCluster > limit {
+		sameCluster = limit
+	}
+	if sameCluster+adjacent > limit {
+		adjacent = limit - sameCluster
+	}
+	exploration = limit - sameCluster - adjacent
+	if exploration < 0 {
+		exploration = 0
+	}
+	return sameCluster, adjacent, exploration
+}
+
+func appendUniqueStrings(base []string, values ...string) []string {
+	if len(values) == 0 {
+		return base
+	}
+	seen := make(map[string]struct{}, len(base)+len(values))
+	for _, item := range base {
+		key := strings.ToLower(strings.TrimSpace(item))
+		if key == "" {
+			continue
+		}
+		seen[key] = struct{}{}
+	}
+	for _, item := range values {
+		value := strings.TrimSpace(item)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		base = append(base, value)
+	}
+	return base
+}
+
+func (h *SpotifyAPIHandler) filterRecommendationsByAudioProfile(
+	ctx context.Context,
+	userID string,
+	accessToken string,
+	snapshot *pipeline.UserSnapshot,
+	items []RecommendationItem,
+	limit int,
+) []RecommendationItem {
+	if len(items) == 0 || limit <= 0 {
+		return []RecommendationItem{}
+	}
+
+	baselineIDs := make([]string, 0, len(snapshot.TopTracks))
+	for _, track := range snapshot.TopTracks {
+		if track.ID == "" {
+			continue
+		}
+		baselineIDs = append(baselineIDs, track.ID)
+		if len(baselineIDs) >= 20 {
+			break
+		}
+	}
+	if len(baselineIDs) == 0 {
+		if len(items) > limit {
+			return items[:limit]
+		}
+		return items
+	}
+
+	candidateIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Track.ID != "" {
+			candidateIDs = append(candidateIDs, item.Track.ID)
+		}
+	}
+	if len(candidateIDs) == 0 {
+		return []RecommendationItem{}
+	}
+
+	baselineFeatures, err := h.fetchAudioFeaturesFromSpotify(ctx, userID, accessToken, baselineIDs)
+	if err != nil || len(baselineFeatures.AudioFeatures) == 0 {
+		if len(items) > limit {
+			return items[:limit]
+		}
+		return items
+	}
+
+	candidateFeatures, err := h.fetchAudioFeaturesFromSpotify(ctx, userID, accessToken, candidateIDs)
+	if err != nil || len(candidateFeatures.AudioFeatures) == 0 {
+		if len(items) > limit {
+			return items[:limit]
+		}
+		return items
+	}
+
+	type audioVector struct {
+		danceability float64
+		energy       float64
+		valence      float64
+		tempo        float64
+	}
+
+	avg := audioVector{}
+	count := 0.0
+	for _, f := range baselineFeatures.AudioFeatures {
+		if f.ID == "" {
+			continue
+		}
+		avg.danceability += f.Danceability
+		avg.energy += f.Energy
+		avg.valence += f.Valence
+		avg.tempo += f.Tempo
+		count++
+	}
+	if count == 0 {
+		if len(items) > limit {
+			return items[:limit]
+		}
+		return items
+	}
+	avg.danceability /= count
+	avg.energy /= count
+	avg.valence /= count
+	avg.tempo /= count
+
+	featureByID := map[string]AudioFeatureItem{}
+	for _, f := range candidateFeatures.AudioFeatures {
+		if f.ID == "" {
+			continue
+		}
+		featureByID[f.ID] = f
+	}
+
+	type scoredItem struct {
+		item  RecommendationItem
+		score float64
+	}
+	scored := make([]scoredItem, 0, len(items))
+	for _, item := range items {
+		feature, ok := featureByID[item.Track.ID]
+		if !ok {
+			continue
+		}
+		score := math.Abs(feature.Danceability-avg.danceability) +
+			math.Abs(feature.Energy-avg.energy) +
+			math.Abs(feature.Valence-avg.valence) +
+			math.Abs((feature.Tempo-avg.tempo)/200.0)
+		scored = append(scored, scoredItem{item: item, score: score})
+	}
+
+	if len(scored) == 0 {
+		if len(items) > limit {
+			return items[:limit]
+		}
+		return items
+	}
+
+	sort.SliceStable(scored, func(i, j int) bool {
+		return scored[i].score < scored[j].score
+	})
+
+	filtered := make([]RecommendationItem, 0, limit)
+	for _, candidate := range scored {
+		filtered = append(filtered, candidate.item)
+		if len(filtered) >= limit {
+			break
+		}
+	}
+	return filtered
 }
 
 func isValidTimeRange(value string) bool {
@@ -2202,27 +2690,16 @@ func setDifferenceCount(a, b map[string]struct{}) int {
 }
 
 func (h *SpotifyAPIHandler) fetchRecommendationsFromSpotify(ctx context.Context, userID, accessToken, mode string, limit int) (*RecommendationsResponse, error) {
-	if h.recSvc != nil && h.pipeline != nil && userID != "" {
-		snapshot, err := h.pipeline.FetchSnapshot(ctx, userID, defaultTimeRange, 50)
-		if err == nil {
-			ranked := h.pipeline.RankedArtists(snapshot, 5)
-			stats, genreWarn := h.pipeline.GenreStats(ctx, snapshot, 3)
-			seedArtists := pipeline.SeedArtistIDs(ranked, 5)
-			seedGenres := pipeline.SeedGenreNames(stats, 3)
-
-			result, recErr := h.recSvc.Recommend(ctx, userID, mode, limit, seedArtists, seedGenres, nil)
-			if recErr == nil && result != nil {
-				resp := recommendationResultToHandler(result)
-				return &resp, nil
-			}
-
-			if recs, ok := h.recommendViaLastFM(ctx, userID, accessToken, snapshot, stats, seedArtists, mode, limit); ok {
-				if recErr != nil {
-					recs.Notice = NoticeRecommendationsListening
-				}
-				_ = genreWarn
-				return recs, nil
-			}
+	if h.pipeline != nil && userID != "" {
+		snapshot, err := h.pipeline.FetchSnapshot(ctx, userID, defaultTimeRange)
+		if err != nil {
+			return nil, err
+		}
+		ranked := h.pipeline.RankedArtists(snapshot, 5)
+		stats, _ := h.pipeline.GenreStats(ctx, snapshot, 5)
+		seedArtists := pipeline.SeedArtistIDs(ranked, 5)
+		if recs, ok := h.recommendViaLastFM(ctx, userID, accessToken, snapshot, stats, seedArtists, mode, limit); ok {
+			return recs, nil
 		}
 	}
 	return h.fallbackRecommendations(ctx, userID, accessToken, limit)
@@ -2278,32 +2755,45 @@ func (h *SpotifyAPIHandler) buildRecommendationsFromSimilarArtists(ctx context.C
 		return []RecommendationItem{}, warnings
 	}
 
+	// New behaviour: use Last.fm sources only as candidate producers; resolve tracks to Spotify via search by artist+title
 	items := make([]RecommendationItem, 0, limit)
 	seenTracks := map[string]struct{}{}
 	for _, artistName := range artistNames {
 		if len(items) >= limit {
 			break
 		}
-		tracks, err := h.searchSpotifyTracksByArtistName(ctx, userID, accessToken, artistName, 3)
-		if err != nil {
-			warnings = append(warnings, "track lookup failed for "+artistName)
-			continue
+		// get artist top tracks from Last.fm and try to resolve
+		topTracks, err := h.lastfmClient.GetArtistTopTracks(ctx, artistName, 8)
+		if err != nil || len(topTracks) == 0 {
+			// try similar artists fallback
+			similar, _ := h.lastfmClient.GetArtistSimilar(ctx, artistName, 4)
+			for _, s := range similar {
+				topTracks2, _ := h.lastfmClient.GetArtistTopTracks(ctx, s.Name, 5)
+				topTracks = append(topTracks, topTracks2...)
+			}
 		}
-		for _, track := range tracks {
+		for _, tt := range topTracks {
 			if len(items) >= limit {
 				break
 			}
-			if track.ID == "" {
+			// resolve to spotify track by artist+title
+			resolved, err := h.searchSpotifyTrackByArtistAndTitle(ctx, userID, accessToken, tt.Artist, tt.Title, 2)
+			if err != nil || len(resolved) == 0 {
 				continue
 			}
-			if _, ok := seenTracks[track.ID]; ok {
-				continue
+			for _, track := range resolved {
+				if len(items) >= limit {
+					break
+				}
+				if track.ID == "" {
+					continue
+				}
+				if _, ok := seenTracks[track.ID]; ok {
+					continue
+				}
+				seenTracks[track.ID] = struct{}{}
+				items = append(items, RecommendationItem{Track: track, Reason: "based on Last.fm artist: " + artistName})
 			}
-			seenTracks[track.ID] = struct{}{}
-			items = append(items, RecommendationItem{
-				Track:  track,
-				Reason: "based on Last.fm similar artist: " + artistName,
-			})
 		}
 	}
 	return items, warnings
@@ -2323,6 +2813,50 @@ func (h *SpotifyAPIHandler) searchSpotifyTracksByArtistName(ctx context.Context,
 	query.Set("limit", strconv.Itoa(limit))
 	query.Set("market", "from_token")
 	query.Set("q", fmt.Sprintf("artist:%q", artistName))
+
+	body, err := h.doSpotifyGETWithAppFallback(ctx, userID, accessToken, "https://api.spotify.com/v1/search?"+query.Encode())
+	if err != nil {
+		return nil, err
+	}
+
+	var payload struct {
+		Tracks struct {
+			Items []TrackItem `json:"items"`
+		} `json:"tracks"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+
+	for i := range payload.Tracks.Items {
+		if payload.Tracks.Items[i].ExternalURLs == nil {
+			payload.Tracks.Items[i].ExternalURLs = make(map[string]string)
+		}
+		if payload.Tracks.Items[i].Artists == nil {
+			payload.Tracks.Items[i].Artists = []SimpleArtist{}
+		}
+	}
+
+	return payload.Tracks.Items, nil
+}
+
+// searchSpotifyTrackByArtistAndTitle searches Spotify for a specific track title and artist name.
+func (h *SpotifyAPIHandler) searchSpotifyTrackByArtistAndTitle(ctx context.Context, userID, accessToken, artistName, title string, limit int) ([]TrackItem, error) {
+	artistName = strings.TrimSpace(artistName)
+	title = strings.TrimSpace(title)
+	if artistName == "" || title == "" {
+		return []TrackItem{}, nil
+	}
+	if limit <= 0 {
+		limit = 3
+	}
+
+	query := url.Values{}
+	query.Set("type", "track")
+	query.Set("limit", strconv.Itoa(limit))
+	query.Set("market", "from_token")
+	q := fmt.Sprintf("track:%q artist:%q", title, artistName)
+	query.Set("q", q)
 
 	body, err := h.doSpotifyGETWithAppFallback(ctx, userID, accessToken, "https://api.spotify.com/v1/search?"+query.Encode())
 	if err != nil {

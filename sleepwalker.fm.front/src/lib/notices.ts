@@ -98,6 +98,8 @@ const RU_GENRE_TRANSLATIONS: Record<string, string> = {
   trance: 'Транс',
   rnb: 'РнБ',
   trap: 'Трэп',
+  rage: 'Рейдж',
+  jerk: 'Джерк',
 };
 
 function titleCaseWords(value: string): string {

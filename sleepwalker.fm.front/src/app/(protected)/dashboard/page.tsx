@@ -10,14 +10,7 @@ import { InfoBanner } from '@/components/info-banner';
 import { formatGenreDisplay, resolveNotice, resolveReason, resolveSourceLabel } from '@/lib/notices';
 
 type DashboardData = {
-  artists: Awaited<ReturnType<typeof api.topArtists>> | null;
-  tracks: Awaited<ReturnType<typeof api.topTracks>> | null;
-  recent: Awaited<ReturnType<typeof api.recentlyPlayed>> | null;
-  genres: Awaited<ReturnType<typeof api.statsGenres>> | null;
-  timeline: Awaited<ReturnType<typeof api.wrappedTimeline>> | null;
-  listening: Awaited<ReturnType<typeof api.statsListeningTime>> | null;
-  audio: Awaited<ReturnType<typeof api.audioFeatures>> | null;
-  wrapped: Awaited<ReturnType<typeof api.wrappedSummary>> | null;
+  snapshot: Awaited<ReturnType<typeof api.snapshot>> | null;
   recs: Awaited<ReturnType<typeof api.recommendations>> | null;
 };
 
@@ -30,24 +23,17 @@ export default function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [partialNotice, setPartialNotice] = useState(false);
   const [data, setData] = useState<DashboardData>({
-    artists: null,
-    tracks: null,
-    recent: null,
-    genres: null,
-    timeline: null,
-    listening: null,
-    audio: null,
-    wrapped: null,
+    snapshot: null,
     recs: null,
   });
 
+  const spotifySnapshot = data.snapshot?.snapshot || null;
+  const topGenres = data.snapshot?.top_genres || [];
+  const recentPlays = spotifySnapshot?.recently_played || [];
+
   const timelineData = useMemo(() => {
-    const byDay = data.timeline?.by_day || [];
-    if (byDay.length > 7) {
-      return byDay.slice(-7);
-    }
-    return byDay;
-  }, [data.timeline]);
+    return buildDayTimeline(recentPlays).slice(-7);
+  }, [recentPlays]);
 
   useEffect(() => {
     if (!session?.userId) return;
@@ -59,15 +45,8 @@ export default function DashboardPage() {
       setPartialNotice(false);
       try {
         const results = await Promise.allSettled([
-          api.topArtists(session.userId),
-          api.topTracks(session.userId),
-          api.recentlyPlayed(session.userId, 20),
-          api.statsGenres(session.userId),
-          api.wrappedTimeline(session.userId),
-          api.statsListeningTime(session.userId),
-          api.audioFeatures(session.userId),
-          api.wrappedSummary(session.userId),
-          api.recommendations(session.userId, 'comfort', 6),
+          api.snapshot(session.userId),
+          api.recommendations(session.userId, 'comfort', 20),
         ]);
 
         if (!mounted) return;
@@ -88,15 +67,8 @@ export default function DashboardPage() {
           result.status === 'fulfilled' ? result.value : null;
 
         setData({
-          artists: valueOrNull(results[0]),
-          tracks: valueOrNull(results[1]),
-          recent: valueOrNull(results[2]),
-          genres: valueOrNull(results[3]),
-          timeline: valueOrNull(results[4]),
-          listening: valueOrNull(results[5]),
-          audio: valueOrNull(results[6]),
-          wrapped: valueOrNull(results[7]),
-          recs: valueOrNull(results[8]),
+          snapshot: valueOrNull(results[0]),
+          recs: valueOrNull(results[1]),
         });
       } catch (e) {
         if (!mounted) return;
@@ -113,70 +85,77 @@ export default function DashboardPage() {
 
   const displayedGenres = useMemo(
     () =>
-      (data.genres?.genres || [])
+      topGenres
         .map((entry) => ({ ...entry, genre: formatGenreDisplay(lang, entry.genre) }))
         .filter((entry) => entry.genre),
-    [data.genres?.genres, lang],
+    [topGenres, lang],
   );
 
-  const displayedWrappedGenres = useMemo(
-    () =>
-      (data.wrapped?.top_genres || [])
-        .map((entry) => formatGenreDisplay(lang, entry.genre))
-        .filter(Boolean),
-    [data.wrapped?.top_genres, lang],
-  );
+  const listeningStats = useMemo(() => computeListeningStats(recentPlays), [recentPlays]);
 
   const avgAudio = useMemo(() => {
-    const items = data.audio?.audio_features || [];
-    if (!items.length) return null;
-    const totals = items.reduce(
-      (acc, f) => ({
-        danceability: acc.danceability + (f.danceability || 0),
-        energy: acc.energy + (f.energy || 0),
-        valence: acc.valence + (f.valence || 0),
-      }),
-      { danceability: 0, energy: 0, valence: 0 },
-    );
+    const items = spotifySnapshot?.audio_features || [];
+        useEffect(() => {
+          if (!session?.userId) return;
+          let mounted = true;
 
-    return [
-      { metric: t('metricDanceability'), value: totals.danceability / items.length },
-      { metric: t('metricEnergy'), value: totals.energy / items.length },
-      { metric: t('metricValence'), value: totals.valence / items.length },
-    ];
-  }, [data.audio, t]);
+          (async () => {
+            setLoading(true);
+            setError(null);
+            setPartialNotice(false);
 
-  const infoNotices = useMemo(() => {
-    const notices = [
-      resolveNotice(lang, data.audio?.notice, data.audio?.warning),
-      resolveNotice(lang, data.recs?.notice, data.recs?.warning),
-      resolveNotice(lang, data.genres?.notice, data.genres?.warning),
-      partialNotice ? t('partialLoad') : null,
-    ].filter((n): n is string => Boolean(n));
-    return [...new Set(notices)];
-  }, [lang, data.audio, data.recs, data.genres, partialNotice, t]);
+            try {
+              // PHASE 1: Fetch snapshot first (should be fast, <100ms)
+              let snapshotData = null;
+              try {
+                snapshotData = await api.snapshot(session.userId);
+                if (mounted) {
+                  setData((prev) => ({
+                    ...prev,
+                    snapshot: snapshotData,
+                  }));
+                  setLoading(false); // UI renders immediately with snapshot
+                }
+              } catch (snapshotError) {
+                if (mounted) {
+                  setError(
+                    snapshotError instanceof Error
+                      ? snapshotError.message
+                      : 'Failed to load snapshot'
+                  );
+                  setLoading(false);
+                }
+                return; // Stop if snapshot fails
+              }
 
-  if (!session?.userId) return <LoadingState text={t('loading')} />;
-  if (loading) return <LoadingState text={t('loading')} />;
-  if (error) return <ErrorState message={error} />;
+              // PHASE 2: Fetch recommendations async (non-blocking, background)
+              try {
+                const recsData = await api.recommendations(session.userId, 'comfort', 20);
+                if (mounted) {
+                  setData((prev) => ({
+                    ...prev,
+                    recs: recsData,
+                  }));
+                }
+              } catch (recsError) {
+                // Recommendations failure is not critical, just set partial notice
+                if (mounted) {
+                  setPartialNotice(true);
+                  console.warn('Recommendations load failed:', recsError);
+                }
+              }
+            } catch (e) {
+              if (mounted) {
+                setError(e instanceof Error ? e.message : 'Failed to load dashboard');
+                setLoading(false);
+              }
+            }
+          })();
 
-  return (
-    <div className="space-y-8">
-      <h1 className="text-4xl font-bold bg-gradient-to-r from-violet-200 to-indigo-200 bg-clip-text text-transparent">{t('dashboard')}</h1>
-
-      <div className="grid md:grid-cols-4 gap-4">
-        <Metric title={t('topArtists')} value={String(data.artists?.items?.length || 0)} />
-        <Metric title={t('topTracks')} value={String(data.tracks?.items?.length || 0)} />
-        <Metric title={t('recentlyPlayed')} value={String(data.listening?.plays || 0)} />
-        <Metric title={t('listeningTime')} value={`${Math.round(data.listening?.hours || 0)}h`} />
-      </div>
-
-      {infoNotices.length > 0 && (
-        <div className="space-y-2">
-          {infoNotices.map((text) => (
-            <InfoBanner key={text} text={text} />
-          ))}
-        </div>
+          return () => {
+            mounted = false;
+          };
+        }, [session?.userId]);
       )}
 
       <div className="grid lg:grid-cols-2 gap-6">
@@ -234,21 +213,21 @@ export default function DashboardPage() {
         </Panel>
 
         <Panel title={t('wrappedSummary')}>
-          {!data.wrapped ? (
+          {!spotifySnapshot ? (
             <EmptyState text={t('empty')} />
           ) : (
             <div className="space-y-3 text-sm text-muted-foreground">
               <p>
-                {t('topArtistsLabel')}: {(data.wrapped.top_artists || []).slice(0, 3).map((a) => a.name).join(', ') || '—'}
+                {t('topArtistsLabel')}: {(spotifySnapshot.top_artists || []).slice(0, 3).map((a) => a.name).join(', ') || '—'}
               </p>
               <p>
-                {t('topTracksLabel')}: {(data.wrapped.top_tracks || []).slice(0, 3).map((tr) => tr.name).join(', ') || '—'}
+                {t('topTracksLabel')}: {(spotifySnapshot.top_tracks || []).slice(0, 3).map((tr) => tr.name).join(', ') || '—'}
               </p>
               <p>
-                {t('topGenresLastFm')}: {displayedWrappedGenres.slice(0, 3).join(', ') || '—'}
+                {t('topGenresLastFm')}: {displayedGenres.slice(0, 3).map((entry) => entry.genre).join(', ') || '—'}
               </p>
               <p>
-                {t('recentPlays')}: {data.wrapped.recent_plays_count ?? '—'}
+                {t('recentPlays')}: {listeningStats.plays ?? '—'}
               </p>
             </div>
           )}
@@ -276,10 +255,10 @@ export default function DashboardPage() {
       <div className="grid lg:grid-cols-3 gap-6">
         <Panel title={t('topArtists')}>
           <ul className="space-y-2 text-sm">
-            {(data.artists?.items || []).slice(0, 8).map((a, index) => (
+            {(spotifySnapshot?.top_artists || []).slice(0, 8).map((a, index) => (
               <li key={a.id} className="flex items-center justify-between gap-3">
                 <span className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-glass-border bg-secondary/30 text-xs font-semibold text-foreground">
-                  {a.position ?? index + 1}
+                  {index + 1}
                 </span>
                 <span className="flex-1">{a.name}</span>
                 <span className="text-muted-foreground text-xs">
@@ -292,7 +271,7 @@ export default function DashboardPage() {
 
         <Panel title={t('topTracks')}>
           <ul className="space-y-2 text-sm">
-            {(data.tracks?.items || []).slice(0, 8).map((track, index) => (
+            {(spotifySnapshot?.top_tracks || []).slice(0, 8).map((track, index) => (
               <li key={track.id} className="space-y-1">
                 <div className="flex items-center gap-3">
                   <span className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-glass-border bg-secondary/30 text-xs font-semibold text-foreground">
@@ -308,7 +287,7 @@ export default function DashboardPage() {
 
         <Panel title={t('recentlyPlayed')}>
           <ul className="space-y-2 text-sm">
-            {(data.recent?.items || []).slice(0, 8).map((r, idx) => (
+            {recentPlays.slice(0, 8).map((r, idx) => (
               <li key={`${r.track?.id || idx}-${idx}`} className="space-y-1">
                 <div className="flex items-center gap-3">
                   <span className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-glass-border bg-secondary/30 text-xs font-semibold text-foreground">
@@ -324,6 +303,56 @@ export default function DashboardPage() {
       </div>
     </div>
   );
+}
+
+function computeListeningStats(
+  items: Array<{
+    track?: {
+      id?: string;
+      duration_ms?: number;
+      artists?: Array<{ id?: string }>;
+    };
+    played_at: string;
+  }>,
+) {
+  const uniqueTracks = new Set<string>();
+  const uniqueArtists = new Set<string>();
+  let durationMs = 0;
+
+  for (const item of items) {
+    durationMs += item.track?.duration_ms || 0;
+    if (item.track?.id) {
+      uniqueTracks.add(item.track.id);
+    }
+    for (const artist of item.track?.artists || []) {
+      if (artist?.id) {
+        uniqueArtists.add(artist.id);
+      }
+    }
+  }
+
+  return {
+    plays: items.length,
+    durationMs,
+    minutes: durationMs / 60000,
+    hours: durationMs / 3600000,
+    uniqueTracks: uniqueTracks.size,
+    uniqueArtists: uniqueArtists.size,
+  };
+}
+
+function buildDayTimeline(items: Array<{ played_at: string }>) {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    const date = new Date(item.played_at);
+    if (Number.isNaN(date.getTime())) continue;
+    const key = date.toISOString().slice(0, 10);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+
+  return Array.from(counts.entries())
+    .map(([key, plays]) => ({ key, plays }))
+    .sort((a, b) => a.key.localeCompare(b.key));
 }
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {

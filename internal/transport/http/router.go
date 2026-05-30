@@ -30,6 +30,7 @@ func NewRouter(deps RouterDeps, allowedOrigins []string) *gin.Engine {
 
 	api := r.Group("/api/spotify")
 	{
+		api.GET("/snapshot/:userId", deps.SpotifyAPI.GetSnapshot)
 		api.GET("/top/artists/:userId", deps.SpotifyAPI.GetTopArtists)
 		api.GET("/top/tracks/:userId", deps.SpotifyAPI.GetTopTracks)
 		api.GET("/recently-played/:userId", deps.SpotifyAPI.GetRecentlyPlayed)

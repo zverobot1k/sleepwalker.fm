@@ -143,6 +143,280 @@ func (c *Client) GetArtistSimilar(ctx context.Context, artist string, limit int)
 	return result, nil
 }
 
+// GetTagTopArtists returns top artist names for a Last.fm tag.
+func (c *Client) GetTagTopArtists(ctx context.Context, tag string, limit int) ([]string, error) {
+	if !c.Enabled() {
+		return []string{}, nil
+	}
+	if limit <= 0 {
+		limit = 30
+	}
+	values := url.Values{}
+	values.Set("method", "tag.gettopartists")
+	values.Set("tag", tag)
+	values.Set("api_key", c.apiKey)
+	values.Set("format", "json")
+	values.Set("limit", fmt.Sprintf("%d", limit))
+
+	body, err := c.do(ctx, values)
+	if err != nil {
+		return nil, err
+	}
+
+	var payload struct {
+		TopArtists struct {
+			Artist json.RawMessage `json:"artist"`
+		} `json:"topartists"`
+		Error   int    `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Error != 0 {
+		return nil, fmt.Errorf("lastfm api error %d: %s", payload.Error, payload.Message)
+	}
+
+	// parse artist list (can be single or array)
+	var artists []struct {
+		Name string `json:"name"`
+	}
+	if len(payload.TopArtists.Artist) == 0 || string(payload.TopArtists.Artist) == "null" {
+		return []string{}, nil
+	}
+	if payload.TopArtists.Artist[0] == '[' {
+		if err := json.Unmarshal(payload.TopArtists.Artist, &artists); err != nil {
+			return nil, err
+		}
+	} else {
+		var single struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(payload.TopArtists.Artist, &single); err != nil {
+			return nil, err
+		}
+		artists = []struct {
+			Name string `json:"name"`
+		}{single}
+	}
+
+	out := make([]string, 0, len(artists))
+	for _, a := range artists {
+		name := strings.TrimSpace(a.Name)
+		if name == "" {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out, nil
+}
+
+// GetTagTopTracks returns top tracks (artist, name) for a Last.fm tag.
+func (c *Client) GetTagTopTracks(ctx context.Context, tag string, limit int) ([]struct{ Artist, Title string }, error) {
+	if !c.Enabled() {
+		return []struct{ Artist, Title string }{}, nil
+	}
+	if limit <= 0 {
+		limit = 40
+	}
+	values := url.Values{}
+	values.Set("method", "tag.gettoptracks")
+	values.Set("tag", tag)
+	values.Set("api_key", c.apiKey)
+	values.Set("format", "json")
+	values.Set("limit", fmt.Sprintf("%d", limit))
+
+	body, err := c.do(ctx, values)
+	if err != nil {
+		return nil, err
+	}
+
+	var payload struct {
+		Tracks struct {
+			Track json.RawMessage `json:"track"`
+		} `json:"tracks"`
+		Error   int    `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Error != 0 {
+		return nil, fmt.Errorf("lastfm api error %d: %s", payload.Error, payload.Message)
+	}
+
+	type tstruct struct {
+		Name   string `json:"name"`
+		Artist struct {
+			Name string `json:"name"`
+		} `json:"artist"`
+	}
+
+	var tracks []tstruct
+	if len(payload.Tracks.Track) == 0 || string(payload.Tracks.Track) == "null" {
+		return []struct{ Artist, Title string }{}, nil
+	}
+	if payload.Tracks.Track[0] == '[' {
+		if err := json.Unmarshal(payload.Tracks.Track, &tracks); err != nil {
+			return nil, err
+		}
+	} else {
+		var single tstruct
+		if err := json.Unmarshal(payload.Tracks.Track, &single); err != nil {
+			return nil, err
+		}
+		tracks = []tstruct{single}
+	}
+
+	out := make([]struct{ Artist, Title string }, 0, len(tracks))
+	for _, tr := range tracks {
+		artist := strings.TrimSpace(tr.Artist.Name)
+		title := strings.TrimSpace(tr.Name)
+		if artist == "" || title == "" {
+			continue
+		}
+		out = append(out, struct{ Artist, Title string }{Artist: artist, Title: title})
+	}
+	return out, nil
+}
+
+// GetArtistTopTracks returns top tracks for an artist.
+func (c *Client) GetArtistTopTracks(ctx context.Context, artist string, limit int) ([]struct{ Artist, Title string }, error) {
+	if !c.Enabled() {
+		return []struct{ Artist, Title string }{}, nil
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	values := url.Values{}
+	values.Set("method", "artist.gettoptracks")
+	values.Set("artist", artist)
+	values.Set("api_key", c.apiKey)
+	values.Set("format", "json")
+	values.Set("limit", fmt.Sprintf("%d", limit))
+
+	body, err := c.do(ctx, values)
+	if err != nil {
+		return nil, err
+	}
+
+	var payload struct {
+		TopTracks struct {
+			Track json.RawMessage `json:"track"`
+		} `json:"toptracks"`
+		Error   int    `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Error != 0 {
+		return nil, fmt.Errorf("lastfm api error %d: %s", payload.Error, payload.Message)
+	}
+
+	type tstruct struct {
+		Name   string `json:"name"`
+		Artist struct {
+			Name string `json:"name"`
+		} `json:"artist"`
+	}
+	var tracks []tstruct
+	if len(payload.TopTracks.Track) == 0 || string(payload.TopTracks.Track) == "null" {
+		return []struct{ Artist, Title string }{}, nil
+	}
+	if payload.TopTracks.Track[0] == '[' {
+		if err := json.Unmarshal(payload.TopTracks.Track, &tracks); err != nil {
+			return nil, err
+		}
+	} else {
+		var single tstruct
+		if err := json.Unmarshal(payload.TopTracks.Track, &single); err != nil {
+			return nil, err
+		}
+		tracks = []tstruct{single}
+	}
+
+	out := make([]struct{ Artist, Title string }, 0, len(tracks))
+	for _, tr := range tracks {
+		artist := strings.TrimSpace(tr.Artist.Name)
+		title := strings.TrimSpace(tr.Name)
+		if artist == "" || title == "" {
+			continue
+		}
+		out = append(out, struct{ Artist, Title string }{Artist: artist, Title: title})
+	}
+	return out, nil
+}
+
+// GetTrackSimilar returns similar tracks (artist,title) for a track.
+func (c *Client) GetTrackSimilar(ctx context.Context, artist, track string, limit int) ([]struct{ Artist, Title string }, error) {
+	if !c.Enabled() {
+		return []struct{ Artist, Title string }{}, nil
+	}
+	if limit <= 0 {
+		limit = 12
+	}
+	values := url.Values{}
+	values.Set("method", "track.getsimilar")
+	values.Set("artist", artist)
+	values.Set("track", track)
+	values.Set("api_key", c.apiKey)
+	values.Set("format", "json")
+	values.Set("limit", fmt.Sprintf("%d", limit))
+
+	body, err := c.do(ctx, values)
+	if err != nil {
+		return nil, err
+	}
+
+	var payload struct {
+		SimilarTracks struct {
+			Track json.RawMessage `json:"track"`
+		} `json:"similartracks"`
+		Error   int    `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Error != 0 {
+		return nil, fmt.Errorf("lastfm api error %d: %s", payload.Error, payload.Message)
+	}
+
+	type tstruct struct {
+		Name   string `json:"name"`
+		Artist struct {
+			Name string `json:"name"`
+		} `json:"artist"`
+	}
+	var tracks []tstruct
+	if len(payload.SimilarTracks.Track) == 0 || string(payload.SimilarTracks.Track) == "null" {
+		return []struct{ Artist, Title string }{}, nil
+	}
+	if payload.SimilarTracks.Track[0] == '[' {
+		if err := json.Unmarshal(payload.SimilarTracks.Track, &tracks); err != nil {
+			return nil, err
+		}
+	} else {
+		var single tstruct
+		if err := json.Unmarshal(payload.SimilarTracks.Track, &single); err != nil {
+			return nil, err
+		}
+		tracks = []tstruct{single}
+	}
+
+	out := make([]struct{ Artist, Title string }, 0, len(tracks))
+	for _, tr := range tracks {
+		artist := strings.TrimSpace(tr.Artist.Name)
+		title := strings.TrimSpace(tr.Name)
+		if artist == "" || title == "" {
+			continue
+		}
+		out = append(out, struct{ Artist, Title string }{Artist: artist, Title: title})
+	}
+	return out, nil
+}
+
 func parseTagList(raw json.RawMessage) ([]TopTag, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return []TopTag{}, nil

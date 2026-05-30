@@ -6,3 +6,4 @@ sleepwalker.fm.front/.next
 sleepwalker.fm.front/dist
 **/node_modules
 **/.next
+.cursor

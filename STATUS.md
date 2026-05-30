@@ -3,55 +3,6 @@
 **Дата**: 24 мая 2026  
 **Статус**: ✅ **ГОТОВ К ЛОКАЛЬНОМУ ТЕСТИРОВАНИЮ**
 
----
-
-## 🔧 Что было исправлено
-
-### 1. Ошибка сборки Go (syntax error)
-**Проблема:**  
-```
-internal/config/config.go:2:1: syntax error: non-declaration statement outside function body
-internal/domain/models.go:2:1: syntax error: non-declaration statement outside function body
-internal/transport/http/handlers/oauth_handler.go:2:1: syntax error: non-declaration statement outside function body
-```
-
-**Причина:** Невидимые символы / BOM (Byte Order Mark) в начале файлов либо нарушение кодировки.
-
-**Решение:** Переписал файлы с чистым контентом через терминал (`cat > file << 'EOF'`).
-
----
-
-### 2. Несовместимость Go версии
-**Проблема:**  
-```
-go.mod requires go >= 1.23 (running go 1.22.12; GOTOOLCHAIN=local)
-```
-
-**Решение:** Обновил Dockerfile с `golang:1.22-alpine` → `golang:1.23-alpine`.
-
----
-
-### 3. Race condition: App стартует раньше БД
-**Проблема:** Приложение пытается подключиться к Postgres до инициализации БД.
-
-**Решение:** Добавил `healthcheck` и `condition: service_healthy` в `docker-compose.yml`.
-
-```yaml
-db:
-  healthcheck:
-    test: ["CMD-SHELL", "pg_isready -U postgres -d sleepwalker"]
-    interval: 2s
-    timeout: 5s
-    retries: 30
-
-app:
-  depends_on:
-    db:
-      condition: service_healthy  # ← теперь ждёт готовности БД
-```
-
----
-
 ## 📚 Документация
 
 ### Основные файлы
