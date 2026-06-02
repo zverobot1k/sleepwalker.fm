@@ -54,6 +54,8 @@ type Artist struct {
 	Genres       []string          `json:"genres"`
 	Images       []Image           `json:"images"`
 	ExternalURLs map[string]string `json:"external_urls"`
+	Score        float64           `json:"score,omitempty"`
+	Position     int               `json:"position,omitempty"`
 }
 
 type Image struct {
@@ -109,24 +111,43 @@ func (p *Pipeline) FetchSnapshot(ctx context.Context, userID, timeRange string) 
 		timeRange = "medium_term"
 	}
 	cacheKey := p.snapshotCacheKey(userID, timeRange)
+
 	if snapshot, ok := p.readSnapshotCache(ctx, cacheKey); ok {
-		log.Printf("DIAG snapshot cache HIT user=%s time_range=%s", userID, timeRange)
-		return snapshot, nil
+		if len(snapshot.TopTracks) > 0 && len(snapshot.TopArtists) > 0 {
+			log.Printf("DIAG snapshot cache HIT user=%s time_range=%s tracks=%d artists=%d", userID, timeRange, len(snapshot.TopTracks), len(snapshot.TopArtists))
+			return snapshot, nil
+		}
+		log.Printf("DIAG snapshot cache HIT but incomplete user=%s — deleting and rebuilding", userID)
+		if p.cache != nil {
+			_ = p.cache.Del(ctx, cacheKey).Err()
+		}
 	}
 	log.Printf("DIAG snapshot cache MISS user=%s time_range=%s", userID, timeRange)
 
 	value, err, shared := p.group.Do(cacheKey, func() (any, error) {
 		if snapshot, ok := p.readSnapshotCache(ctx, cacheKey); ok {
-			log.Printf("DIAG snapshot cache REUSED user=%s time_range=%s", userID, timeRange)
-			return snapshot, nil
+			if len(snapshot.TopTracks) > 0 && len(snapshot.TopArtists) > 0 {
+				log.Printf("DIAG snapshot cache REUSED user=%s time_range=%s", userID, timeRange)
+				return snapshot, nil
+			}
 		}
-		snapshot, err := p.buildSnapshot(ctx, userID, timeRange)
-		if err != nil {
-			return nil, err
+		// Retry once: emptySpotifyPayload() silently fills empty arrays when Spotify is degraded.
+		// Treat empty required data as an error and retry after a brief wait.
+		var lastErr error
+		for attempt := 0; attempt < 2; attempt++ {
+			if attempt > 0 {
+				log.Printf("DIAG snapshot build retry attempt=%d user=%s last_err=%v", attempt+1, userID, lastErr)
+				time.Sleep(2 * time.Second)
+			}
+			snapshot, err := p.buildSnapshot(ctx, userID, timeRange)
+			if err == nil {
+				p.writeSnapshotCache(ctx, cacheKey, snapshot)
+				log.Printf("DIAG snapshot cache REBUILT user=%s attempt=%d tracks=%d artists=%d recent=%d", userID, attempt+1, len(snapshot.TopTracks), len(snapshot.TopArtists), len(snapshot.RecentlyPlayed))
+				return snapshot, nil
+			}
+			lastErr = err
 		}
-		p.writeSnapshotCache(ctx, cacheKey, snapshot)
-		log.Printf("DIAG snapshot cache REBUILT user=%s time_range=%s", userID, timeRange)
-		return snapshot, nil
+		return nil, fmt.Errorf("snapshot build failed after 2 attempts: %w", lastErr)
 	})
 	if shared {
 		log.Printf("DIAG snapshot singleflight shared user=%s time_range=%s", userID, timeRange)
@@ -140,16 +161,25 @@ func (p *Pipeline) FetchSnapshot(ctx context.Context, userID, timeRange string) 
 func (p *Pipeline) buildSnapshot(ctx context.Context, userID, timeRange string) (*SpotifySnapshot, error) {
 	topTracks, err := p.fetchTopTracks(ctx, userID, timeRange, 50)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("top_tracks: %w", err)
 	}
+	if len(topTracks) == 0 {
+		return nil, fmt.Errorf("top_tracks: empty response (spotify may be degraded)")
+	}
+
 	artists, err := p.fetchTopArtistsRaw(ctx, userID, timeRange, 50)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("top_artists: %w", err)
 	}
-	recent, err := p.fetchRecentlyPlayed(ctx, userID, 50)
-	if err != nil {
-		return nil, err
+	if len(artists) == 0 {
+		return nil, fmt.Errorf("top_artists: empty response (spotify may be degraded)")
 	}
+
+	recent, recentErr := p.fetchRecentlyPlayed(ctx, userID, 50)
+	if recentErr != nil {
+		log.Printf("DIAG buildSnapshot: recently_played failed user=%s err=%v (non-fatal)", userID, recentErr)
+	}
+
 	snapshot := &SpotifySnapshot{
 		UserID:         userID,
 		TimeRange:      timeRange,
@@ -374,6 +404,10 @@ func (p *Pipeline) readSnapshotCache(ctx context.Context, key string) (*SpotifyS
 
 func (p *Pipeline) writeSnapshotCache(ctx context.Context, key string, snapshot *SpotifySnapshot) {
 	if p.cache == nil || snapshot == nil {
+		return
+	}
+	if len(snapshot.TopTracks) == 0 || len(snapshot.TopArtists) == 0 {
+		log.Printf("DIAG writeSnapshotCache: refusing to cache incomplete snapshot (tracks=%d artists=%d)", len(snapshot.TopTracks), len(snapshot.TopArtists))
 		return
 	}
 	body, err := json.Marshal(snapshot)

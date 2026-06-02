@@ -246,7 +246,7 @@ export class ApiRequestError extends Error {
 const responseCache = new Map<string, CachedValue>();
 const inflightRequests = new Map<string, Promise<unknown>>();
 
-const DEFAULT_GET_TTL_MS = 45 * 1000;
+const DEFAULT_GET_TTL_MS = 5 * 60 * 1000; // 5 minutes — backend Redis cache is 30min+
 const SESSION_TTL_MS = 15 * 1000;
 
 export function cacheSessionState(userId: string, state: SessionStateResponse) {
@@ -449,9 +449,9 @@ export const api = {
       `/api/stats/listening-time/${encodeURIComponent(userId)}${buildQuery({ from: params?.from, to: params?.to })}`,
     ),
 
-  recommendations: (userId: string, mode = 'comfort', limit = 20) =>
+  recommendations: (userId: string, limit = 20) =>
     request<RecommendationsResponse>(
-      `/api/recommendations/${encodeURIComponent(userId)}${buildQuery({ mode, limit })}`,
+      `/api/recommendations/${encodeURIComponent(userId)}${buildQuery({ limit })}`,
     ),
 
   createPlaylist: (userId: string, limit = 20) =>

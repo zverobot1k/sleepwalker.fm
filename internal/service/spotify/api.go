@@ -31,8 +31,8 @@ type APIService struct {
 }
 
 const (
-	spotifyGlobalRequestsPerSecond = 6
-	spotifyUserRequestsPerSecond   = 1
+	spotifyGlobalRequestsPerSecond = 20
+	spotifyUserRequestsPerSecond   = 5
 	spotifyRateWindow              = time.Second
 	spotifyDegradedTTL             = 60 * time.Second
 	spotifyStateTTL                = 5 * time.Minute

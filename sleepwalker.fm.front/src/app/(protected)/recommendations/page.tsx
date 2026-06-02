@@ -8,12 +8,9 @@ import { useI18n } from '@/components/providers/i18n-provider';
 import { InfoBanner } from '@/components/info-banner';
 import { resolveNotice, resolveReason, resolveSourceLabel } from '@/lib/notices';
 
-type Mode = 'comfort' | 'explore';
-
 export default function RecommendationsPage() {
   const session = useSession();
   const { t, lang } = useI18n();
-  const [mode, setMode] = useState<Mode>('comfort');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<Awaited<ReturnType<typeof api.recommendations>> | null>(null);
@@ -23,14 +20,14 @@ export default function RecommendationsPage() {
     setLoading(true);
     setError(null);
     try {
-      const response = await api.recommendations(session.userId, mode, 20);
+      const response = await api.recommendations(session.userId, 20);
       setData(response);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load recommendations');
     } finally {
       setLoading(false);
     }
-  }, [session?.userId, mode]);
+  }, [session?.userId]);
 
   useEffect(() => {
     load();
@@ -43,27 +40,9 @@ export default function RecommendationsPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <h1 className="text-4xl font-bold bg-gradient-to-r from-violet-200 to-indigo-200 bg-clip-text text-transparent">
-          {t('recommendations')}
-        </h1>
-        <div className="flex gap-2">
-          {(['comfort', 'explore'] as Mode[]).map((m) => (
-            <button
-              key={m}
-              type="button"
-              onClick={() => setMode(m)}
-              className={`px-4 py-2 rounded-lg text-sm border ${
-                mode === m
-                  ? 'border-violet-400 bg-violet-500/20 text-foreground'
-                  : 'border-glass-border bg-glass-bg text-muted-foreground'
-              }`}
-            >
-              {m === 'comfort' ? t('comfortMode') : t('exploreMode')}
-            </button>
-          ))}
-        </div>
-      </div>
+      <h1 className="text-4xl font-bold bg-gradient-to-r from-violet-200 to-indigo-200 bg-clip-text text-transparent">
+        {t('recommendations')}
+      </h1>
 
       <p className="text-sm text-muted-foreground">
         {t('source')}: {resolveSourceLabel(lang, data?.source)}

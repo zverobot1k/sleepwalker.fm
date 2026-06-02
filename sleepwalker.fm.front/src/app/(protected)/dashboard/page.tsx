@@ -7,7 +7,7 @@ import { useSession } from '@/hooks/use-session';
 import { EmptyState, ErrorState, LoadingState } from '@/components/ui-state';
 import { useI18n } from '@/components/providers/i18n-provider';
 import { InfoBanner } from '@/components/info-banner';
-import { formatGenreDisplay, resolveNotice, resolveReason, resolveSourceLabel } from '@/lib/notices';
+import { formatGenreDisplay, resolveReason, resolveSourceLabel } from '@/lib/notices';
 
 type DashboardData = {
   snapshot: Awaited<ReturnType<typeof api.snapshot>> | null;
@@ -22,18 +22,11 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [partialNotice, setPartialNotice] = useState(false);
-  const [data, setData] = useState<DashboardData>({
-    snapshot: null,
-    recs: null,
-  });
+  const [data, setData] = useState<DashboardData>({ snapshot: null, recs: null });
 
   const spotifySnapshot = data.snapshot?.snapshot || null;
   const topGenres = data.snapshot?.top_genres || [];
   const recentPlays = spotifySnapshot?.recently_played || [];
-
-  const timelineData = useMemo(() => {
-    return buildDayTimeline(recentPlays).slice(-7);
-  }, [recentPlays]);
 
   useEffect(() => {
     if (!session?.userId) return;
@@ -43,38 +36,35 @@ export default function DashboardPage() {
       setLoading(true);
       setError(null);
       setPartialNotice(false);
+
       try {
-        const results = await Promise.allSettled([
-          api.snapshot(session.userId),
-          api.recommendations(session.userId, 'comfort', 20),
-        ]);
-
-        if (!mounted) return;
-
-        const anySuccess = results.some((result) => result.status === 'fulfilled');
-        const anyFailure = results.some((result) => result.status === 'rejected');
-        if (!anySuccess) {
-          const first = results.find((r) => r.status === 'rejected');
-          const message = first?.status === 'rejected' && first.reason instanceof Error
-            ? first.reason.message
-            : 'Failed to load dashboard';
-          setError(message);
-        } else if (anyFailure) {
-          setPartialNotice(true);
+        // Phase 1: snapshot — fast when Redis-cached (~50ms)
+        try {
+          const snapshotData = await api.snapshot(session.userId);
+          if (mounted) {
+            setData((prev) => ({ ...prev, snapshot: snapshotData }));
+            setLoading(false);
+          }
+        } catch (snapshotError) {
+          if (mounted) {
+            setError(snapshotError instanceof Error ? snapshotError.message : 'Failed to load snapshot');
+            setLoading(false);
+          }
+          return;
         }
 
-        const valueOrNull = <T,>(result: PromiseSettledResult<T>) =>
-          result.status === 'fulfilled' ? result.value : null;
-
-        setData({
-          snapshot: valueOrNull(results[0]),
-          recs: valueOrNull(results[1]),
-        });
+        // Phase 2: recommendations in background — slower (Last.fm calls)
+        try {
+          const recsData = await api.recommendations(session.userId, 20);
+          if (mounted) setData((prev) => ({ ...prev, recs: recsData }));
+        } catch {
+          if (mounted) setPartialNotice(true);
+        }
       } catch (e) {
-        if (!mounted) return;
-        setError(e instanceof Error ? e.message : 'Failed to load dashboard');
-      } finally {
-        if (mounted) setLoading(false);
+        if (mounted) {
+          setError(e instanceof Error ? e.message : 'Failed to load dashboard');
+          setLoading(false);
+        }
       }
     })();
 
@@ -95,68 +85,44 @@ export default function DashboardPage() {
 
   const avgAudio = useMemo(() => {
     const items = spotifySnapshot?.audio_features || [];
-        useEffect(() => {
-          if (!session?.userId) return;
-          let mounted = true;
+    if (!items.length) return null;
+    const n = items.length;
+    const sums = items.reduce(
+      (acc, f) => ({
+        danceability: acc.danceability + f.danceability,
+        energy: acc.energy + f.energy,
+        valence: acc.valence + f.valence,
+        acousticness: acc.acousticness + (f.acousticness ?? 0),
+      }),
+      { danceability: 0, energy: 0, valence: 0, acousticness: 0 },
+    );
+    return [
+      { metric: 'Danceability', value: +(sums.danceability / n).toFixed(2) },
+      { metric: 'Energy', value: +(sums.energy / n).toFixed(2) },
+      { metric: 'Valence', value: +(sums.valence / n).toFixed(2) },
+      { metric: 'Acousticness', value: +(sums.acousticness / n).toFixed(2) },
+    ];
+  }, [spotifySnapshot]);
 
-          (async () => {
-            setLoading(true);
-            setError(null);
-            setPartialNotice(false);
+  const timelineData = useMemo(() => buildDayTimeline(recentPlays).slice(-7), [recentPlays]);
 
-            try {
-              // PHASE 1: Fetch snapshot first (should be fast, <100ms)
-              let snapshotData = null;
-              try {
-                snapshotData = await api.snapshot(session.userId);
-                if (mounted) {
-                  setData((prev) => ({
-                    ...prev,
-                    snapshot: snapshotData,
-                  }));
-                  setLoading(false); // UI renders immediately with snapshot
-                }
-              } catch (snapshotError) {
-                if (mounted) {
-                  setError(
-                    snapshotError instanceof Error
-                      ? snapshotError.message
-                      : 'Failed to load snapshot'
-                  );
-                  setLoading(false);
-                }
-                return; // Stop if snapshot fails
-              }
+  if (!session?.userId || loading) return <LoadingState text={t('loading')} />;
+  if (error) return <ErrorState message={error} />;
 
-              // PHASE 2: Fetch recommendations async (non-blocking, background)
-              try {
-                const recsData = await api.recommendations(session.userId, 'comfort', 20);
-                if (mounted) {
-                  setData((prev) => ({
-                    ...prev,
-                    recs: recsData,
-                  }));
-                }
-              } catch (recsError) {
-                // Recommendations failure is not critical, just set partial notice
-                if (mounted) {
-                  setPartialNotice(true);
-                  console.warn('Recommendations load failed:', recsError);
-                }
-              }
-            } catch (e) {
-              if (mounted) {
-                setError(e instanceof Error ? e.message : 'Failed to load dashboard');
-                setLoading(false);
-              }
-            }
-          })();
+  return (
+    <div className="space-y-6">
+      <h1 className="text-4xl font-bold bg-gradient-to-r from-violet-200 to-indigo-200 bg-clip-text text-transparent">
+        {t('dashboard')}
+      </h1>
 
-          return () => {
-            mounted = false;
-          };
-        }, [session?.userId]);
-      )}
+      {partialNotice && <InfoBanner text={t('partialLoad')} />}
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <Metric title={t('recentPlays')} value={String(listeningStats.plays ?? '—')} />
+        <Metric title={t('uniqueTracks')} value={String(listeningStats.uniqueTracks ?? '—')} />
+        <Metric title={t('uniqueArtists')} value={String(listeningStats.uniqueArtists ?? '—')} />
+        <Metric title={t('listeningHours')} value={listeningStats.hours ? listeningStats.hours.toFixed(1) + 'h' : '—'} />
+      </div>
 
       <div className="grid lg:grid-cols-2 gap-6">
         <Panel title={t('genreDistribution')}>
@@ -321,13 +287,9 @@ function computeListeningStats(
 
   for (const item of items) {
     durationMs += item.track?.duration_ms || 0;
-    if (item.track?.id) {
-      uniqueTracks.add(item.track.id);
-    }
+    if (item.track?.id) uniqueTracks.add(item.track.id);
     for (const artist of item.track?.artists || []) {
-      if (artist?.id) {
-        uniqueArtists.add(artist.id);
-      }
+      if (artist?.id) uniqueArtists.add(artist.id);
     }
   }
 
@@ -349,7 +311,6 @@ function buildDayTimeline(items: Array<{ played_at: string }>) {
     const key = date.toISOString().slice(0, 10);
     counts.set(key, (counts.get(key) || 0) + 1);
   }
-
   return Array.from(counts.entries())
     .map(([key, plays]) => ({ key, plays }))
     .sort((a, b) => a.key.localeCompare(b.key));

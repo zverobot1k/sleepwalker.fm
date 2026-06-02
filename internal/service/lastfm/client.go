@@ -9,14 +9,24 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
+
+type cachedEntry struct {
+	body      []byte
+	expiresAt time.Time
+}
 
 type Client struct {
 	apiKey     string
 	httpClient *http.Client
 	baseURL    string
+	cacheMu    sync.Mutex
+	cache      map[string]cachedEntry
 }
+
+const cacheTTL = 2 * time.Hour
 
 type TopTag struct {
 	Name  string `json:"name"`
@@ -32,7 +42,12 @@ func NewClient(apiKey string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 10 * time.Second}
 	}
-	return &Client{apiKey: apiKey, httpClient: httpClient, baseURL: "https://ws.audioscrobbler.com/2.0/"}
+	return &Client{
+		apiKey:     apiKey,
+		httpClient: httpClient,
+		baseURL:    "https://ws.audioscrobbler.com/2.0/",
+		cache:      make(map[string]cachedEntry),
+	}
 }
 
 func (c *Client) Enabled() bool {
@@ -453,7 +468,29 @@ func parseSimilarArtists(raw json.RawMessage) ([]SimilarArtist, error) {
 	return []SimilarArtist{single}, nil
 }
 
+func (c *Client) cacheGet(key string) ([]byte, bool) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	entry, ok := c.cache[key]
+	if !ok || time.Now().After(entry.expiresAt) {
+		delete(c.cache, key)
+		return nil, false
+	}
+	return entry.body, true
+}
+
+func (c *Client) cacheSet(key string, body []byte) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	c.cache[key] = cachedEntry{body: body, expiresAt: time.Now().Add(cacheTTL)}
+}
+
 func (c *Client) do(ctx context.Context, values url.Values) ([]byte, error) {
+	cacheKey := values.Encode()
+	if cached, ok := c.cacheGet(cacheKey); ok {
+		return cached, nil
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"?"+values.Encode(), nil)
 	if err != nil {
 		return nil, err
@@ -475,6 +512,7 @@ func (c *Client) do(ctx context.Context, values url.Values) ([]byte, error) {
 		log.Printf("DIAG lastfm non-2xx: url=%s status=%d body=%s", req.URL.String(), resp.StatusCode, strings.TrimSpace(string(body)))
 		return nil, fmt.Errorf("lastfm http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+	c.cacheSet(cacheKey, body)
 	return body, nil
 }
 

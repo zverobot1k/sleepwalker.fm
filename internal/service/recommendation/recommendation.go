@@ -6,6 +6,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 
 	lastfmservice "sleepwalker.fm/internal/service/lastfm"
 	"sleepwalker.fm/internal/service/pipeline"
@@ -85,10 +86,12 @@ func (s *Service) RecommendFromSnapshot(ctx context.Context, snapshot *pipeline.
 	source := "spotify_fallback"
 	warning := ""
 
-	// Try Last.fm for genre seeds
+	// Fetch genre stats once and reuse for both seeds and item building
+	var cachedGenreStats []lastfmservice.GenreStat
 	if s != nil && s.lastfm != nil && s.lastfm.Enabled() {
 		artistNames := uniqueArtistNames(snapshot.TopArtists)
 		genreStats, genreWarning := s.aggregateGenres(ctx, artistNames, 5)
+		cachedGenreStats = genreStats
 		seedGenres = pickGenreNames(genreStats, 5)
 		if len(seedGenres) > 0 {
 			source = "lastfm_genre_engine"
@@ -111,12 +114,10 @@ func (s *Service) RecommendFromSnapshot(ctx context.Context, snapshot *pipeline.
 		log.Printf("DIAG recommendations using fallback genres=%v source=%s", seedGenres, source)
 	}
 
-	// Build items: prefer Last.fm when available
+	// Build items: reuse already-fetched genre stats — no second aggregateGenres call
 	var items []Item
 	if s != nil && s.lastfm != nil && s.lastfm.Enabled() && source == "lastfm_genre_engine" {
-		artistNames := uniqueArtistNames(snapshot.TopArtists)
-		genreStats, _ := s.aggregateGenres(ctx, artistNames, 5)
-		items = s.buildItems(ctx, snapshot, genreStats, seedGenres, limit*2)
+		items = s.buildItems(ctx, snapshot, cachedGenreStats, seedGenres, limit*2)
 	} else {
 		items = buildBasicRecommendations(snapshot, seedGenres, limit*2)
 	}
@@ -171,12 +172,13 @@ func (s *Service) buildItems(ctx context.Context, snapshot *pipeline.SpotifySnap
 	}
 
 	// Use Last.fm tag/top tracks for each seed genre
+	// Limit: 20 tracks per genre tag (was 40) + top 5 tag artists only (was 20)
 	for gi, genre := range seedGenres {
 		weight := genreWeight[genre]
 		if weight <= 0 {
 			weight = 1
 		}
-		tagTracks, err := s.lastfm.GetTagTopTracks(ctx, genre, 40)
+		tagTracks, err := s.lastfm.GetTagTopTracks(ctx, genre, 20)
 		if err == nil {
 			for idx, tr := range tagTracks {
 				score := weight*100 - float64(idx)
@@ -186,11 +188,11 @@ func (s *Service) buildItems(ctx context.Context, snapshot *pipeline.SpotifySnap
 				addCandidate(tr.Artist, tr.Title, score, fmt.Sprintf("based on genre %s", genre), genre)
 			}
 		}
-		// tag artists -> artist top tracks
-		tagArtists, err := s.lastfm.GetTagTopArtists(ctx, genre, 20)
+		// tag top artists -> their tracks (cap at 5 artists to limit API calls)
+		tagArtists, err := s.lastfm.GetTagTopArtists(ctx, genre, 5)
 		if err == nil {
 			for ai, artistName := range tagArtists {
-				topTracks, err := s.lastfm.GetArtistTopTracks(ctx, artistName, 8)
+				topTracks, err := s.lastfm.GetArtistTopTracks(ctx, artistName, 5)
 				if err != nil {
 					continue
 				}
@@ -202,27 +204,32 @@ func (s *Service) buildItems(ctx context.Context, snapshot *pipeline.SpotifySnap
 		}
 	}
 
-	// Also use user's top artists for similar tracks
+	// Use top 5 Spotify artists only (was unlimited) to limit API calls
+	maxArtists := 5
 	for ai, artist := range snapshot.TopArtists {
+		if ai >= maxArtists {
+			break
+		}
 		artistName := strings.TrimSpace(artist.Name)
 		if artistName == "" {
 			continue
 		}
-		baseScore := float64(len(snapshot.TopArtists)-ai) * 12
-		topTracks, err := s.lastfm.GetArtistTopTracks(ctx, artistName, 10)
+		baseScore := float64(maxArtists-ai) * 12
+		topTracks, err := s.lastfm.GetArtistTopTracks(ctx, artistName, 8)
 		if err == nil {
 			for ti, tr := range topTracks {
 				addCandidate(tr.Artist, tr.Title, baseScore-float64(ti), fmt.Sprintf("top artist %s", artistName), "artist")
 			}
 		}
-		similarArtists, err := s.lastfm.GetArtistSimilar(ctx, artistName, 8)
+		// cap similar artists at 3 (was 8) to avoid fan-out explosion
+		similarArtists, err := s.lastfm.GetArtistSimilar(ctx, artistName, 3)
 		if err == nil {
 			for si, sim := range similarArtists {
 				simName := strings.TrimSpace(sim.Name)
 				if simName == "" {
 					continue
 				}
-				simTracks, err := s.lastfm.GetArtistTopTracks(ctx, simName, 6)
+				simTracks, err := s.lastfm.GetArtistTopTracks(ctx, simName, 5)
 				if err != nil {
 					continue
 				}
@@ -335,25 +342,25 @@ func buildBasicRecommendations(snapshot *pipeline.SpotifySnapshot, seedGenres []
 
 func buildSpotifyFallbackRecommendations(snapshot *pipeline.SpotifySnapshot, count int) []Item {
 	items := make([]Item, 0, count)
-	for idx, item := range snapshot.RecentlyPlayed {
+	for idx, track := range snapshot.TopTracks {
 		if idx >= count {
 			break
 		}
 		items = append(items, Item{
 			Track: Track{
-				ID:         item.Track.ID,
-				Name:       item.Track.Name,
-				URI:        item.Track.URI,
-				DurationMS: item.Track.DurationMS,
+				ID:         track.ID,
+				Name:       track.Name,
+				URI:        track.URI,
+				DurationMS: track.DurationMS,
 				Artists: func() []SimpleArtist {
-					res := make([]SimpleArtist, len(item.Track.Artists))
-					for i, a := range item.Track.Artists {
+					res := make([]SimpleArtist, len(track.Artists))
+					for i, a := range track.Artists {
 						res[i] = SimpleArtist{ID: a.ID, Name: a.Name}
 					}
 					return res
 				}(),
 				ExternalURLs: map[string]string{},
-			}, Reason: "from your recently played",
+			}, Reason: "from your top tracks",
 		})
 	}
 	return items
@@ -367,23 +374,38 @@ func (s *Service) aggregateGenres(ctx context.Context, artistNames []string, tag
 		tagsPerArtist = 5
 	}
 	counts := map[string]int{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4) // max 4 concurrent Last.fm calls
+
 	for _, artist := range artistNames {
 		artist = strings.TrimSpace(artist)
 		if artist == "" {
 			continue
 		}
-		tags, err := s.lastfm.GetArtistTopTags(ctx, artist, tagsPerArtist)
-		if err != nil {
-			continue
-		}
-		for _, tag := range tags {
-			n := lastfmservice.NormalizeTag(tag)
-			if n == "" {
-				continue
+		wg.Add(1)
+		go func(a string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			tags, err := s.lastfm.GetArtistTopTags(ctx, a, tagsPerArtist)
+			if err != nil {
+				return
 			}
-			counts[n]++
-		}
+			mu.Lock()
+			for _, tag := range tags {
+				n := lastfmservice.NormalizeTag(tag)
+				if n == "" {
+					continue
+				}
+				counts[n]++
+			}
+			mu.Unlock()
+		}(artist)
 	}
+	wg.Wait()
+
 	if len(counts) == 0 {
 		return []lastfmservice.GenreStat{{Genre: "unknown", Count: 0, Weight: 0}}, "no last.fm tags found"
 	}
